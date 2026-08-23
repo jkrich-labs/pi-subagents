@@ -513,6 +513,31 @@ test("extension prevents parent polling and exposes Cursor-compatible delegation
   ring.reset();
 });
 
+test("final child reports become model-visible exactly once", () => {
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const messages: Array<{ text: string; options: unknown }> = [];
+  const pi = {
+    appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
+    sendUserMessage(text: string, options: unknown) { messages.push({ text, options }); },
+  } as any;
+  const lens = {
+    type: "completion" as const,
+    childId: "review-child",
+    ref: "review-child",
+    sessionPath: "/sessions/review.jsonl",
+    digest: "Standards report: one blocking lifecycle defect.",
+    lastTurnAt: 123,
+  };
+
+  deliverToParent(pi, { type: "lens", lens, final: false });
+  assert.equal(messages.length, 0, "progress lenses do not wake the parent");
+  deliverToParent(pi, { type: "lens", lens, final: true });
+  assert.equal(entries.filter((entry) => entry.type === "subagent_lens").length, 2);
+  assert.equal(messages.length, 1, "DONE report is delivered once as model-visible follow-up");
+  assert.match(messages[0].text, /review-child.*COMPLETED.*blocking lifecycle defect/is);
+  assert.deepEqual(messages[0].options, { deliverAs: "followUp" });
+});
+
 test("child failures become model-visible follow-up messages", () => {
   const entries: Array<{ type: string; data: unknown }> = [];
   const messages: Array<{ text: string; options: unknown }> = [];

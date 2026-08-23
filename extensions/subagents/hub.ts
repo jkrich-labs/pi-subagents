@@ -25,7 +25,7 @@ export interface SpawnRequest {
 }
 
 export type Delivery =
-  | { type: "lens"; lens: Lens }
+  | { type: "lens"; lens: Lens; final: boolean }
   | { type: "ask"; childId: string; question: string }
   | { type: "control"; childId: string; token: string }
   | { type: "crash"; childId: string; reason: string };
@@ -383,6 +383,7 @@ export class Hub {
       this.deliverFor(st.generation, {
         type: "lens",
         lens: makeCompletionLens(st.id, clean, st.sessionFile),
+        final: report.done,
       });
     }
 

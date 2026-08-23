@@ -505,6 +505,7 @@ test("hub: spawn → completion lens → DONE-PARENT → done status", { timeout
 
     const lensDeliveries = deliveries.filter((d) => d.type === "lens");
     assert.equal(lensDeliveries.length, 1, "exactly one lens per settled run (no duplicate finalization)");
+    assert.equal(lensDeliveries[0].final, true, "DONE-PARENT marks the lens for model-visible delivery");
     assert.ok(
       lensDeliveries[0].type === "lens" && lensDeliveries[0].lens.digest.includes("PONG"),
       "completion digest carries the child's answer",

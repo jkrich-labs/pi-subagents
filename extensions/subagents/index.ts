@@ -446,6 +446,12 @@ export function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
   switch (d.type) {
     case "lens":
       pi.appendEntry("subagent_lens", d.lens);
+      if (d.final && d.lens.type === "completion") {
+        pi.sendUserMessage(
+          `[subagent ${d.lens.childId}] COMPLETED:\n${d.lens.digest}`,
+          { deliverAs: "followUp" },
+        );
+      }
       break;
     case "ask":
       pi.sendUserMessage(`[subagent ${d.childId}] ASK: ${d.question}`, { deliverAs: "followUp" });
