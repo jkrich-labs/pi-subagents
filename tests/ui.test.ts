@@ -490,6 +490,12 @@ test("extension prevents parent polling and exposes Cursor-compatible delegation
     /failed.*model is not supported by provider/i,
     "steering a failed child reports the failure to the parent immediately",
   );
+  ring.upsert("done-child", { title: "reusable", status: "done" });
+  assert.match(
+    (await tools.get("steer_subagent").execute("call", { child_id: "done-child", message: "continue" })).content[0].text,
+    /not live/i,
+    "a done child is sent to the hub for reuse instead of being rejected as done",
+  );
   ring.reset();
   assert.deepEqual(await tools.get("AwaitShell").execute(), {
     content: [{ type: "text", text: "Background tasks report completion automatically. End this turn now; do not poll or sleep." }],
@@ -535,7 +541,17 @@ test("final child reports become model-visible exactly once", () => {
   assert.equal(entries.filter((entry) => entry.type === "subagent_lens").length, 2);
   assert.equal(messages.length, 1, "DONE report is delivered once as model-visible follow-up");
   assert.match(messages[0].text, /review-child.*COMPLETED.*blocking lifecycle defect/is);
-  assert.deepEqual(messages[0].options, { deliverAs: "followUp" });
+  assert.deepEqual(messages[0].options, { deliverAs: "steer" });
+
+  deliverToParent(pi, {
+    type: "control",
+    childId: "empty-report-child",
+    token: "DONE-PARENT",
+    reportDelivered: false,
+  });
+  assert.equal(messages.length, 2, "token-only completion wakes the parent");
+  assert.match(messages[1].text, /empty-report-child.*COMPLETED.*no textual report/i);
+  assert.deepEqual(messages[1].options, { deliverAs: "steer" });
 });
 
 test("child failures become model-visible follow-up messages", () => {
@@ -553,7 +569,7 @@ test("child failures become model-visible follow-up messages", () => {
   });
   assert.equal(entries[0].type, "subagent_crash");
   assert.match(messages[0].text, /failed-child.*FAILED.*model is not supported.*do not retry/i);
-  assert.deepEqual(messages[0].options, { deliverAs: "followUp" });
+  assert.deepEqual(messages[0].options, { deliverAs: "steer" });
 });
 
 test("manual commands list presets and launch a named agent", async () => {

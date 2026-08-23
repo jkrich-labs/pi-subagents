@@ -6,7 +6,7 @@
  * kill — S-08.
  */
 import { Ground } from "./ground.ts";
-import { RpcChild, type RpcChildHandle, type RpcChildOptions } from "./child.ts";
+import { RpcChild, type CommandResponse, type RpcChildHandle, type RpcChildOptions } from "./child.ts";
 import { ring, type ChildView } from "./ring/store.ts";
 import { reportFrom as tokenReport } from "./tokens.ts";
 import { makeAskLens, makeCompletionLens, type Lens } from "./lenses.ts";
@@ -27,8 +27,12 @@ export interface SpawnRequest {
 export type Delivery =
   | { type: "lens"; lens: Lens; final: boolean }
   | { type: "ask"; childId: string; question: string }
-  | { type: "control"; childId: string; token: string }
+  | { type: "control"; childId: string; token: string; reportDelivered?: boolean }
   | { type: "crash"; childId: string; reason: string };
+
+const ACTIVE_STATUSES = new Set<ChildView["status"]>(["spawning", "working", "asking"]);
+const REAPABLE_STATUSES = new Set<ChildView["status"]>(["done", "failed"]);
+const DEFAULT_IDLE_REAP_MS = 5 * 60_000;
 
 interface ChildState {
   id: string;
@@ -48,6 +52,8 @@ interface ChildState {
   generation: number;
   pendingTurnError?: string;
   pendingTurnMessage?: Record<string, unknown>;
+  idleReapTimer?: ReturnType<typeof setTimeout>;
+  reaping?: boolean;
 }
 
 export const CHILD_SYSTEM_PROMPT = [
@@ -152,9 +158,11 @@ export class Hub {
   readonly ground: Ground;
   private readonly deliver: (d: Delivery) => void;
   private readonly spawnChild: (options: RpcChildOptions) => Promise<RpcChildHandle>;
+  private readonly idleReapMs: number;
   private readonly kids = new Map<string, ChildState>();
   private readonly unsupportedSelections = new Set<string>();
   private generation = 0;
+  private lifecycleTail: Promise<void> = Promise.resolve();
 
   /** Liveness engine hooks (S-08) */
   onSpawn: ((id: string) => void) | null = null;
@@ -175,10 +183,16 @@ export class Hub {
     ground?: Ground;
     deliver: (d: Delivery) => void;
     spawnChild?: (options: RpcChildOptions) => Promise<RpcChildHandle>;
+    /** Grace period during which a completed child can receive a follow-up. */
+    idleReapMs?: number;
   }) {
     this.ground = opts.ground ?? new Ground();
     this.deliver = opts.deliver;
     this.spawnChild = opts.spawnChild ?? RpcChild.spawnChild;
+    this.idleReapMs = opts.idleReapMs ?? DEFAULT_IDLE_REAP_MS;
+    if (!Number.isFinite(this.idleReapMs) || this.idleReapMs < 0) {
+      throw new Error("idleReapMs must be a finite, non-negative number");
+    }
   }
 
   private deliverFor(generation: number, delivery: Delivery): void {
@@ -201,8 +215,27 @@ export class Hub {
     throw new Error(`subagent ${operation} cancelled by session replacement`);
   }
 
+  private async withLifecycleLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTail;
+    let release!: () => void;
+    this.lifecycleTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   async spawn(req: SpawnRequest): Promise<string> {
     const generation = this.generation;
+    return this.withLifecycleLock(() => this.spawnUnlocked(req, generation));
+  }
+
+  private async spawnUnlocked(req: SpawnRequest, generation: number): Promise<string> {
+    if (generation !== this.generation) {
+      throw new Error("subagent spawn cancelled by session replacement");
+    }
     const prompt = req.prompt.trim();
     if (!prompt) throw new Error("subagent spawn requires a non-empty prompt");
     const launch = resolveLaunch({ ...req, prompt });
@@ -211,12 +244,22 @@ export class Hub {
         `subagent launch blocked: ${launch.provider}/${launch.model} already failed as unsupported; choose a supported preset instead of retrying`,
       );
     }
-    const duplicate = [...this.kids.values()].find(
-      (state) => state.child.isRunning() && titleKey(state.title) === titleKey(launch.title),
-    );
+    const duplicate = [...this.kids.values()].find((state) => {
+      const status = ring.get(state.id)?.status;
+      return state.child.isRunning() &&
+        (status === undefined || ACTIVE_STATUSES.has(status)) &&
+        titleKey(state.title) === titleKey(launch.title);
+    });
     if (duplicate) {
       throw new Error(`subagent already working: ${duplicate.id} (${duplicate.title})`);
     }
+    const superseded = [...this.kids.values()].filter((state) => {
+      const status = ring.get(state.id)?.status;
+      return state.child.isRunning() &&
+        REAPABLE_STATUSES.has(status ?? "working") &&
+        titleKey(state.title) === titleKey(launch.title);
+    });
+    for (const state of superseded) await this.reapState(state, true);
 
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const child = await this.spawnChild({
@@ -250,7 +293,12 @@ export class Hub {
     this.kids.set(id, state);
     child.setLineHandler((line) => this.onLine(id, line));
     child.onExit = () => {
-      if (!this.kids.has(id)) return;
+      if (this.kids.get(id)?.child !== child) return;
+      if (state.reaping) {
+        this.kids.delete(id);
+        this.onExit?.(id, "idle-reap");
+        return;
+      }
       this.kids.delete(id);
       const alreadyFailed = ring.get(id)?.status === "failed";
       if (!alreadyFailed) ring.upsert(id, { status: "crashed" });
@@ -332,6 +380,48 @@ export class Hub {
     }
   }
 
+  private cancelIdleReap(st: ChildState): void {
+    if (st.idleReapTimer === undefined) return;
+    clearTimeout(st.idleReapTimer);
+    st.idleReapTimer = undefined;
+  }
+
+  private async reapState(st: ChildState, required = false): Promise<void> {
+    if (this.kids.get(st.id) !== st) return;
+    this.cancelIdleReap(st);
+    st.reaping = true;
+    try {
+      await st.child.shutdown();
+    } catch (error) {
+      st.reaping = false;
+      if (this.kids.get(st.id) === st) this.scheduleIdleReap(st);
+      throw error;
+    }
+    if (this.kids.get(st.id) !== st) return;
+    if (st.child.isRunning()) {
+      st.reaping = false;
+      this.scheduleIdleReap(st);
+      throw new Error(`subagent ${st.id} did not stop during idle reap`);
+    }
+    this.kids.delete(st.id);
+    st.child.setLineHandler(null);
+    st.child.onExit = null;
+    this.onExit?.(st.id, "idle-reap");
+  }
+
+  private scheduleIdleReap(st: ChildState): void {
+    this.cancelIdleReap(st);
+    if (this.idleReapMs === 0) return;
+    st.idleReapTimer = setTimeout(() => {
+      st.idleReapTimer = undefined;
+      if (this.kids.get(st.id) !== st || !REAPABLE_STATUSES.has(ring.get(st.id)?.status ?? "working")) return;
+      void this.withLifecycleLock(() => this.reapState(st)).catch(() => {
+        /* a failed reap remains live and is retried after another grace period */
+      });
+    }, this.idleReapMs);
+    st.idleReapTimer.unref?.();
+  }
+
   /** Finalize a settled run into a lens (idempotent per agent_end cursor). */
   private finalize(st: ChildState): void {
     const ends = st.child.events("agent_end");
@@ -360,6 +450,7 @@ export class Hub {
         ask: undefined,
         lastCompletionAt: Date.now(),
       });
+      this.scheduleIdleReap(st);
       this.deliverFor(st.generation, { type: "crash", childId: st.id, reason });
       return;
     }
@@ -385,11 +476,21 @@ export class Hub {
         lens: makeCompletionLens(st.id, clean, st.sessionFile),
         final: report.done,
       });
+    } else if (report.done) {
+      ring.upsert(st.id, { status: "done", ask: undefined, error: undefined, lastCompletionAt: Date.now() });
     }
 
     if (report.reset) ring.upsert(st.id, { lastCompletionAt: undefined, status: "working", error: undefined });
     if (report.incr) ring.upsert(st.id, { scopeCount: (ring.get(st.id)?.scopeCount ?? 0) + 1 });
-    if (report.done) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "DONE-PARENT" });
+    if (report.done) {
+      this.scheduleIdleReap(st);
+      this.deliverFor(st.generation, {
+        type: "control",
+        childId: st.id,
+        token: "DONE-PARENT",
+        reportDelivered: clean.length > 0,
+      });
+    }
     if (report.reset) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "RESET-PARENT" });
     if (report.incr) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "INCR-PARENT" });
   }
@@ -399,31 +500,58 @@ export class Hub {
    * (measured S-03 fact: follow_up on an idle child never starts a run).
    */
   async steer(idOrAll: string, text: string): Promise<boolean> {
+    return this.withLifecycleLock(() => this.steerUnlocked(idOrAll, text));
+  }
+
+  private async steerUnlocked(idOrAll: string, text: string): Promise<boolean> {
     const targets = idOrAll === "*" ? [...this.kids.keys()] : [idOrAll];
     let any = false;
     for (const id of targets) {
       const st = this.kids.get(id);
       if (!st || !st.child.isRunning()) continue;
+      const status = ring.get(id)?.status;
+      if (status !== undefined && !ACTIVE_STATUSES.has(status) && status !== "done") continue;
       any = true;
+      const wasIdle = status === "done";
+      if (wasIdle) this.cancelIdleReap(st);
       const busy = st.child.events("agent_end").length > st.child.events("agent_settled").length;
-      const accepted = await st.child.send(busy ? "steer" : "prompt", { message: text }, 10_000);
-      if (!accepted.success && accepted.error) {
-        throw new Error(`steer ${id} failed: ${accepted.error}`);
+      let accepted: CommandResponse;
+      try {
+        accepted = await st.child.send(busy ? "steer" : "prompt", { message: text }, 10_000);
+      } catch (error) {
+        if (wasIdle && this.kids.get(id) === st) this.scheduleIdleReap(st);
+        throw error;
+      }
+      if (!accepted.success) {
+        if (wasIdle && this.kids.get(id) === st) this.scheduleIdleReap(st);
+        if (accepted.error) throw new Error(`steer ${id} failed: ${accepted.error}`);
+        continue;
+      }
+      if (this.kids.get(id) === st) {
+        ring.upsert(id, { status: "working", ask: undefined, error: undefined });
       }
     }
     return any;
   }
 
   async kill(id: string): Promise<void> {
+    return this.withLifecycleLock(() => this.killUnlocked(id));
+  }
+
+  private async killUnlocked(id: string): Promise<void> {
+    const generation = this.generation;
     const st = this.kids.get(id);
     if (!st) return;
+    this.cancelIdleReap(st);
     try {
       st.child.kill();
       await st.child.shutdown();
     } finally {
       this.kids.delete(id);
-      ring.upsert(id, { status: "killed" });
-      this.onExit?.(id, "kill");
+      if (generation === this.generation) {
+        ring.upsert(id, { status: "killed" });
+        this.onExit?.(id, "kill");
+      }
     }
   }
 
@@ -453,6 +581,10 @@ export class Hub {
    * and switch_session back, preserving context/cache.
    */
   async resume(id: string, prompt: string): Promise<boolean> {
+    return this.withLifecycleLock(() => this.resumeUnlocked(id, prompt));
+  }
+
+  private async resumeUnlocked(id: string, prompt: string): Promise<boolean> {
     const view = ring.get(id);
     if (!view) return false;
     const sessionFile = view.sessionFile;
@@ -470,8 +602,10 @@ export class Hub {
     const toolPolicy = view.toolPolicy ?? "normal";
     const state = this.kids.get(id);
     if (state?.child.isRunning()) {
-      // already live — do nothing
-      return true;
+      // A settled child is an idle, reusable thread. A follow-up must wake it.
+      if (view.status === "done" && prompt) return this.steerUnlocked(id, prompt);
+      if (view.status === "failed") await this.reapState(state, true);
+      else return true;
     }
 
     const generation = this.generation;
@@ -520,7 +654,12 @@ export class Hub {
     this.kids.set(id, st);
     child.setLineHandler((line) => this.onLine(id, line));
     child.onExit = () => {
-      if (!this.kids.has(id)) return;
+      if (this.kids.get(id)?.child !== child) return;
+      if (st.reaping) {
+        this.kids.delete(id);
+        this.onExit?.(id, "idle-reap");
+        return;
+      }
       this.kids.delete(id);
       const alreadyFailed = ring.get(id)?.status === "failed";
       if (!alreadyFailed) ring.upsert(id, { status: "crashed" });
@@ -529,6 +668,7 @@ export class Hub {
         this.deliverFor(st.generation, { type: "crash", childId: id, reason: "process exited" });
       }
     };
+    this.onSpawn?.(id);
     ring.upsert(id, { status: "working", ask: undefined, error: undefined });
     if (prompt) void child.send("prompt", { message: prompt }, 10_000).catch(() => {});
     return true;
@@ -543,6 +683,7 @@ export class Hub {
     const states = [...this.kids.values()];
     this.generation += 1;
     for (const state of states) {
+      this.cancelIdleReap(state);
       state.child.setLineHandler(null);
       state.child.onExit = null;
     }

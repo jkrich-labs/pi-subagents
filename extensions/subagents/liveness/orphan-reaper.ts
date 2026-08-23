@@ -22,6 +22,14 @@ export function writePidfile(pidsDir: string, e: PidfileEntry): void {
   writeFile(pidsDir, e);
 }
 
+export function removePidfile(pidsDir: string, childId: string): void {
+  try {
+    unlinkSync(pidPath(pidsDir, childId));
+  } catch {
+    /* the process may have exited before its pidfile was written */
+  }
+}
+
 export function readPidfile(path: string): PidfileEntry | null {
   try {
     return JSON.parse(readFileSync(path, "utf8")) as PidfileEntry;

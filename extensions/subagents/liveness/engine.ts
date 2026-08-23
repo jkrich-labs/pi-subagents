@@ -9,7 +9,7 @@ import { freshStallState, stallStep, shouldProbe, isStalled } from "./stall.ts";
 import { frameFor, isLooping } from "./loop-fingerprint.ts";
 import { probeDecision, type ProbeState } from "./probe.ts";
 import { JsonlTombstones } from "./tombstones.ts";
-import { writePidfile, sweep, pidAlive } from "./orphan-reaper.ts";
+import { writePidfile, removePidfile, sweep, pidAlive } from "./orphan-reaper.ts";
 import { ring } from "../ring/store.ts";
 
 export interface EngineManifest {
@@ -55,6 +55,8 @@ export class LivenessEngine {
 
   private onExit(id: string, reason: string): void {
     const st = this.states.get(id);
+    removePidfile(this.hub.ground.pids, id);
+    this.states.delete(id);
     this.tombstones.write({
       childId: id,
       reason,

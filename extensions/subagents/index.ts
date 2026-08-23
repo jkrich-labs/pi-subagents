@@ -259,7 +259,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const view = hub.getView(childId);
-      if (!view || view.status === "failed" || view.status === "crashed" || view.status === "killed" || view.status === "done") {
+      if (!view || view.status === "failed" || view.status === "crashed" || view.status === "killed") {
         const status = view?.status ?? "unknown";
         const reason = view?.error ? `: ${view.error}` : "";
         return {
@@ -449,16 +449,22 @@ export function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
       if (d.final && d.lens.type === "completion") {
         pi.sendUserMessage(
           `[subagent ${d.lens.childId}] COMPLETED:\n${d.lens.digest}`,
-          { deliverAs: "followUp" },
+          { deliverAs: "steer" },
         );
       }
       break;
     case "ask":
-      pi.sendUserMessage(`[subagent ${d.childId}] ASK: ${d.question}`, { deliverAs: "followUp" });
+      pi.sendUserMessage(`[subagent ${d.childId}] ASK: ${d.question}`, { deliverAs: "steer" });
       break;
     case "control":
       if (d.token === "DONE-PARENT") {
         pi.appendEntry("subagent_done", { childId: d.childId, at: Date.now() });
+        if (!d.reportDelivered) {
+          pi.sendUserMessage(
+            `[subagent ${d.childId}] COMPLETED with no textual report.`,
+            { deliverAs: "steer" },
+          );
+        }
       }
       break;
     case "crash": {
@@ -468,7 +474,7 @@ export function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
         : " Inspect the failure before deciding whether to resume or replace it.";
       pi.sendUserMessage(
         `[subagent ${d.childId}] FAILED: ${d.reason}.${retryGuidance}`,
-        { deliverAs: "followUp" },
+        { deliverAs: "steer" },
       );
       break;
     }

@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ground } from "../extensions/subagents/ground.ts";
@@ -97,7 +97,9 @@ test("registry: model resolution falls back to testing model", () => {
 function recordingChildren() {
   const launches: RpcChildOptions[] = [];
   const commands: Array<{ command: string; body: Record<string, unknown> }> = [];
+  const handlers: Array<((line: WireLine) => void) | null> = [];
   let spawnCount = 0;
+  let shutdownCount = 0;
   const spawnChild = async (opts: RpcChildOptions): Promise<RpcChildHandle> => {
     launches.push({ ...opts });
     spawnCount += 1;
@@ -108,7 +110,14 @@ function recordingChildren() {
       lines,
       sessionFile: `/sessions/child-${spawnCount}.jsonl`,
       onExit: null,
-      setLineHandler() {},
+      setLineHandler(handler) {
+        handlers[spawnCount - 1] = handler
+          ? (line) => {
+            lines.push(line);
+            handler(line);
+          }
+          : null;
+      },
       async send(command: string, body: Record<string, unknown> = {}): Promise<CommandResponse> {
         commands.push({ command, body });
         return { command, success: true };
@@ -116,10 +125,20 @@ function recordingChildren() {
       events(type: string) { return lines.filter((line) => line.type === type); },
       isRunning() { return running; },
       kill() { running = false; },
-      async shutdown() { running = false; },
+      async shutdown() {
+        running = false;
+        shutdownCount += 1;
+      },
     };
   };
-  return { launches, commands, spawnChild, get spawnCount() { return spawnCount; } };
+  return {
+    launches,
+    commands,
+    handlers,
+    spawnChild,
+    get spawnCount() { return spawnCount; },
+    get shutdownCount() { return shutdownCount; },
+  };
 }
 
 test("hub: named launch reaches ring and resume preserves resolved preset configuration", async () => {
@@ -184,6 +203,87 @@ test("hub: rejects a retry title while the original child is still live", async 
   );
   assert.equal(recorder.spawnCount, 1, "duplicate retry did not start another process");
   await hub.shutdownAll();
+});
+
+test("hub: a completed child can be steered again while it remains idle", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: (delivery) => deliveries.push(delivery), spawnChild: recorder.spawnChild });
+
+  try {
+    const id = await hub.spawn({ title: "reusable", prompt: "finish the first pass" });
+    const assistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "First pass complete\nDONE-PARENT" }],
+      stopReason: "stop",
+    };
+    const emit = recorder.handlers[0];
+    assert.ok(emit, "spawned child has a line handler");
+    emit({ type: "turn_end", message: assistant });
+    emit({ type: "agent_end", messages: [assistant] });
+    emit({ type: "agent_settled" });
+    assert.equal(hub.getView(id)?.status, "done");
+
+    assert.equal(await hub.steer(id, "continue from the first pass"), true);
+    assert.equal(recorder.commands.at(-1)?.command, "prompt", "settled children receive a fresh prompt");
+    assert.equal(recorder.commands.at(-1)?.body.message, "continue from the first pass");
+    assert.equal(hub.getView(id)?.status, "working", "a resumed child is visible as active");
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: a replacement supersedes a completed same-title child", async () => {
+  ring.reset();
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: () => {}, spawnChild: recorder.spawnChild });
+
+  try {
+    const id = await hub.spawn({ title: "replaceable", prompt: "finish" });
+    const assistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "Finished\nDONE-PARENT" }],
+      stopReason: "stop",
+    };
+    recorder.handlers[0]?.({ type: "turn_end", message: assistant });
+    recorder.handlers[0]?.({ type: "agent_end", messages: [assistant] });
+    recorder.handlers[0]?.({ type: "agent_settled" });
+
+    const replacement = await hub.spawn({ title: "replaceable retry", prompt: "start replacement" });
+    assert.notEqual(replacement, id);
+    assert.equal(recorder.shutdownCount, 1, "replacement waits for the completed process to stop");
+    assert.equal(await hub.steer(id, "do not restart the superseded child"), false);
+    assert.equal(hub.getView(id)?.status, "done", "superseded history remains completed");
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: completed children are autoreaped after the reuse grace period", async () => {
+  ring.reset();
+  const recorder = recordingChildren();
+  const ground = tmpGround();
+  const hub = new Hub({ ground, deliver: () => {}, spawnChild: recorder.spawnChild, idleReapMs: 5 });
+  new LivenessEngine(hub, ground.tombstones);
+
+  const id = await hub.spawn({ title: "expires", prompt: "finish" });
+  const assistant = {
+    role: "assistant",
+    content: [{ type: "text", text: "Finished\nDONE-PARENT" }],
+    stopReason: "stop",
+  };
+  recorder.handlers[0]?.({ type: "turn_end", message: assistant });
+  recorder.handlers[0]?.({ type: "agent_end", messages: [assistant] });
+  recorder.handlers[0]?.({ type: "agent_settled" });
+  assert.deepEqual(hub.list(), [id], "the completed child remains reusable during the grace period");
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(hub.list(), [], "the idle process is removed from the live hub after the grace period");
+  assert.equal(recorder.shutdownCount, 1, "autoreap shuts down the idle process");
+  assert.equal(existsSync(join(ground.pids, `${id}.pid`)), false, "autoreap removes the liveness pidfile");
+  assert.equal(ring.get(id)?.status, "done", "history remains inspectable after autoreap");
+  ring.reset();
 });
 
 test("hub: reports ownership only for live child PIDs", async () => {
@@ -429,6 +529,7 @@ test("hub: a settled provider error becomes failed instead of remaining working"
   assert.equal(hub.getView(id)?.status, "failed");
   assert.equal(hub.getView(id)?.error, "model is not supported by provider");
   assert.equal(deliveries.filter((delivery) => delivery.type === "crash").length, 1);
+  assert.equal(await hub.steer(id, "retry the failed work"), false, "failed children cannot be retried through steering");
   await assert.rejects(
     hub.spawn({ title: "unsupported retry under another title", prompt: "run again" }),
     /already failed as unsupported; choose a supported preset instead of retrying/,
