@@ -59,6 +59,12 @@ test("registry: model resolution falls back to testing model", () => {
   assert.equal(resolved.model, TESTING_MODEL);
   assert.equal(resolved.provider, TESTING_PROVIDER);
   assert.equal(resolved.thinking, TESTING_THINKING);
+
+  // sanity token + junk provider must drop to defaults
+  const patched = resolveSpawn({ model: "testing", provider: "registry", thinking: "bogus" });
+  assert.equal(patched.model, TESTING_MODEL);
+  assert.equal(patched.provider, TESTING_PROVIDER);
+  assert.equal(patched.thinking, TESTING_THINKING);
 });
 
 test("hub: spawn → completion lens → DONE-PARENT → done status", { timeout: 240_000, concurrency: 1 }, async () => {

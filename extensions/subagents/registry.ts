@@ -34,6 +34,15 @@ export function loadRegistry(): RegistryModel[] {
 
 const loaded = loadRegistry();
 
+/** Providers the registry names, plus pi's known-good built-ins. */
+export function knownProviders(): Set<string> {
+  const set = new Set<string>(["hyper"]);
+  for (const m of loaded) {
+    if (m.provider) set.add(m.provider);
+  }
+  return set;
+}
+
 export function findModel(id: string): RegistryModel | undefined {
   return loaded.find((m) => m.id === id);
 }
@@ -54,7 +63,11 @@ export function resolveSpawn(req: { model?: string; provider?: string; thinking?
   const reg = findModel(model);
 
   let provider = req.provider?.trim() ?? "";
-  if (provider === "" || /^(default|testing|none|auto)$/i.test(provider)) {
+  const DROP = /^(default|testing|none|auto)$/i;
+  if (provider === "" || DROP.test(provider)) {
+    provider = reg?.provider ?? defaultProvider;
+  } else if (!knownProviders().has(provider)) {
+    // Junk tokens from the LLM (e.g. "registry") must never reach spawn.
     provider = reg?.provider ?? defaultProvider;
   }
 
