@@ -61,7 +61,6 @@ export class LivenessEngine {
       lastCursor: st ? String(st.probe.fires) : null,
       at: new Date().toISOString(),
     });
-    ring.upsert(id, { status: reason === "crash" ? "crashed" : "killed" });
   }
 
   private onTurn(id: string, rec: { toolCallCount: number; thinkingText: string; reportText: string; toolNames: string[]; toolArgsHash: string; toolResultsHash: string; assistantText: string }): void {

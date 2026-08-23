@@ -18,7 +18,20 @@ export interface RpcChildOptions {
   systemPrompt?: string;
 }
 
-export class RpcChild {
+export interface RpcChildHandle {
+  readonly proc: { readonly pid?: number };
+  readonly lines: WireLine[];
+  sessionFile?: string;
+  onExit: (() => void) | null;
+  setLineHandler(fn: ((line: WireLine) => void) | null): void;
+  send(cmd: string, body?: Record<string, unknown>, timeoutMs?: number): Promise<CommandResponse>;
+  events(type: string): WireLine[];
+  isRunning(): boolean;
+  kill(): void;
+  shutdown(timeoutMs?: number): Promise<void>;
+}
+
+export class RpcChild implements RpcChildHandle {
   readonly proc: ChildProcessWithoutNullStreams;
   readonly lines: WireLine[] = [];
   /** Session file captured from the spawn-time get_state (never --no-session). */

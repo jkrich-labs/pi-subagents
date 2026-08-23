@@ -40,12 +40,12 @@ export default function (pi: ExtensionAPI) {
     if (pollTimer === null) pollTimer = setInterval(poll, 1000);
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     if (pollTimer !== null) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
-    void hub.shutdownAll();
+    await hub.shutdownAll();
   });
 
   // Spawn tool — the parent LLM calls this to delegate background work.

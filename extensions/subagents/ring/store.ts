@@ -10,6 +10,7 @@ export type ChildStatus =
   | "working"
   | "asking"
   | "done"
+  | "failed"
   | "crashed"
   | "killed";
 
@@ -25,6 +26,7 @@ export interface ChildView {
   compactions: number;
   lastCompletionAt?: number;
   ask?: string;
+  error?: string;
   scopeCount: number;
   sessionFile?: string;
   stallCount: number;
@@ -69,9 +71,11 @@ export class RingStore extends EventEmitter {
     this.emit("remove", id);
   }
 
-  /** Test seam — reset to empty. */
+  /** Clear the fleet, notifying UI subscribers for session replacement. */
   reset(): void {
+    const ids = [...this.children.keys()];
     this.children.clear();
+    for (const id of ids) this.emit("remove", id);
   }
 }
 

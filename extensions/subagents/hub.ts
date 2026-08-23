@@ -6,7 +6,7 @@
  * kill — S-08.
  */
 import { Ground } from "./ground.ts";
-import { RpcChild } from "./child.ts";
+import { RpcChild, type RpcChildHandle, type RpcChildOptions } from "./child.ts";
 import { ring, type ChildView } from "./ring/store.ts";
 import { reportFrom as tokenReport } from "./tokens.ts";
 import { makeAskLens, makeCompletionLens, type Lens } from "./lenses.ts";
@@ -29,7 +29,7 @@ export type Delivery =
 interface ChildState {
   id: string;
   title: string;
-  child: RpcChild;
+  child: RpcChildHandle;
   model?: string;
   provider?: string;
   thinking?: string;
@@ -37,6 +37,9 @@ interface ChildState {
   turnCount: number;
   compactions: number;
   finalizedEnds: number;
+  generation: number;
+  pendingTurnError?: string;
+  pendingTurnMessage?: Record<string, unknown>;
 }
 
 export const CHILD_SYSTEM_PROMPT = [
@@ -57,6 +60,30 @@ function assistantTextOf(msg: Record<string, unknown> | undefined): string {
     .join("\n");
 }
 
+function safeErrorDetail(raw: string): string {
+  if (/model[\s\S]{0,120}not supported|unsupported[\s\S]{0,120}model/i.test(raw)) {
+    return "model is not supported by provider";
+  }
+  if (/rate[ _-]?limit|\b429\b/i.test(raw)) return "provider rate limit reached";
+  if (/context[ _-]?(window|limit)|too many tokens|maximum context/i.test(raw)) {
+    return "model context limit exceeded";
+  }
+  if (/timed? out|timeout/i.test(raw)) return "provider request timed out";
+  if (/unauthori[sz]ed|forbidden|authentication|\b401\b|\b403\b/i.test(raw)) {
+    return "provider authentication failed";
+  }
+  return "child provider request failed";
+}
+
+function terminalErrorOf(message: Record<string, unknown> | undefined): string | undefined {
+  if (!message) return undefined;
+  const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+  if (message.stopReason === "error" || errorMessage.length > 0) {
+    return errorMessage ? safeErrorDetail(errorMessage) : "child turn failed";
+  }
+  return undefined;
+}
+
 function stripControlTokens(text: string): string {
   return text
     .split("\n")
@@ -67,7 +94,9 @@ function stripControlTokens(text: string): string {
 export class Hub {
   readonly ground: Ground;
   private readonly deliver: (d: Delivery) => void;
+  private readonly spawnChild: (options: RpcChildOptions) => Promise<RpcChildHandle>;
   private readonly kids = new Map<string, ChildState>();
+  private generation = 0;
 
   /** Liveness engine hooks (S-08) */
   onSpawn: ((id: string) => void) | null = null;
@@ -84,15 +113,41 @@ export class Hub {
       }) => void)
     | null = null;
 
-  constructor(opts: { ground?: Ground; deliver: (d: Delivery) => void }) {
+  constructor(opts: {
+    ground?: Ground;
+    deliver: (d: Delivery) => void;
+    spawnChild?: (options: RpcChildOptions) => Promise<RpcChildHandle>;
+  }) {
     this.ground = opts.ground ?? new Ground();
     this.deliver = opts.deliver;
+    this.spawnChild = opts.spawnChild ?? RpcChild.spawnChild;
+  }
+
+  private deliverFor(generation: number, delivery: Delivery): void {
+    if (generation === this.generation) this.deliver(delivery);
+  }
+
+  private async shutdownUnregisteredChild(child: RpcChildHandle): Promise<void> {
+    child.setLineHandler(null);
+    child.onExit = null;
+    await child.shutdown();
+  }
+
+  private async rejectReplacedSessionChild(
+    generation: number,
+    child: RpcChildHandle,
+    operation: "spawn" | "resume",
+  ): Promise<void> {
+    if (generation === this.generation) return;
+    await this.shutdownUnregisteredChild(child);
+    throw new Error(`subagent ${operation} cancelled by session replacement`);
   }
 
   async spawn(req: SpawnRequest): Promise<string> {
+    const generation = this.generation;
     const { model, provider, thinking } = resolveSpawn(req);
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const child = await RpcChild.spawnChild({
+    const child = await this.spawnChild({
       sessionDir: this.ground.sessions,
       sessionName: `subagent-${id}`,
       provider,
@@ -100,6 +155,7 @@ export class Hub {
       thinking,
       systemPrompt: CHILD_SYSTEM_PROMPT,
     });
+    await this.rejectReplacedSessionChild(generation, child, "spawn");
 
     const state: ChildState = {
       id,
@@ -112,15 +168,19 @@ export class Hub {
       turnCount: 0,
       compactions: 0,
       finalizedEnds: 0,
+      generation,
     };
     this.kids.set(id, state);
     child.setLineHandler((line) => this.onLine(id, line));
     child.onExit = () => {
       if (!this.kids.has(id)) return;
       this.kids.delete(id);
-      ring.upsert(id, { status: "crashed" });
+      const alreadyFailed = ring.get(id)?.status === "failed";
+      if (!alreadyFailed) ring.upsert(id, { status: "crashed" });
       this.onExit?.(id, "crash");
-      this.deliver({ type: "crash", childId: id, reason: "process exited" });
+      if (!alreadyFailed) {
+        this.deliverFor(state.generation, { type: "crash", childId: id, reason: "process exited" });
+      }
     };
     this.onSpawn?.(id);
 
@@ -151,7 +211,10 @@ export class Hub {
         // Build a liveness turn record from the last turn_end message.
         {
           const msg = line.message as Record<string, unknown> | undefined;
-          const content = (msg?.content ?? []) as Array<Record<string, unknown>>;
+          const turnFailure = terminalErrorOf(msg);
+          st.pendingTurnMessage = turnFailure ? undefined : msg;
+          st.pendingTurnError = turnFailure;
+          const content = (turnFailure ? [] : (msg?.content ?? [])) as Array<Record<string, unknown>>;
           const toolCalls = content.filter((c) => c.type === "toolCall").length;
           const thinkingText = content
             .filter((c) => c.type === "thinking")
@@ -196,31 +259,54 @@ export class Hub {
     const last = ends[ends.length - 1];
     const messages = (last.messages ?? []) as Array<Record<string, unknown>>;
     const assistants = messages.filter((m) => m.role === "assistant");
-    const finalText = assistants.length > 0 ? assistantTextOf(assistants[assistants.length - 1]) : "";
+    const lastAssistant = assistants.length > 0 ? assistants[assistants.length - 1] : undefined;
+    const finalMessage = lastAssistant ?? st.pendingTurnMessage;
+    const finalText = assistantTextOf(finalMessage);
     st.finalizedEnds = ends.length;
+
+    const messageFailure = [...messages].reverse().map(terminalErrorOf).find((value) => value !== undefined);
+    const failure = messageFailure ?? terminalErrorOf(last) ?? terminalErrorOf(finalMessage) ?? st.pendingTurnError;
+    st.pendingTurnError = undefined;
+    st.pendingTurnMessage = undefined;
+    if (failure) {
+      const reason = failure;
+      ring.upsert(st.id, {
+        status: "failed",
+        error: reason,
+        ask: undefined,
+        lastCompletionAt: Date.now(),
+      });
+      this.deliverFor(st.generation, { type: "crash", childId: st.id, reason });
+      return;
+    }
 
     const report = tokenReport(finalText);
 
     if (report.ask) {
-      ring.upsert(st.id, { status: "asking", ask: report.ask });
-      this.deliver({ type: "ask", childId: st.id, question: report.ask });
+      ring.upsert(st.id, { status: "asking", ask: report.ask, error: undefined });
+      this.deliverFor(st.generation, { type: "ask", childId: st.id, question: report.ask });
       return;
     }
 
     const clean = stripControlTokens(finalText).trim();
     if (clean.length > 0) {
-      ring.upsert(st.id, { status: report.done ? "done" : "working", lastCompletionAt: Date.now() });
-      this.deliver({
+      ring.upsert(st.id, {
+        status: report.done ? "done" : "working",
+        ask: undefined,
+        error: undefined,
+        lastCompletionAt: Date.now(),
+      });
+      this.deliverFor(st.generation, {
         type: "lens",
         lens: makeCompletionLens(st.id, clean, st.sessionFile),
       });
     }
 
-    if (report.reset) ring.upsert(st.id, { lastCompletionAt: undefined, status: "working" });
+    if (report.reset) ring.upsert(st.id, { lastCompletionAt: undefined, status: "working", error: undefined });
     if (report.incr) ring.upsert(st.id, { scopeCount: (ring.get(st.id)?.scopeCount ?? 0) + 1 });
-    if (report.done) this.deliver({ type: "control", childId: st.id, token: "DONE-PARENT" });
-    if (report.reset) this.deliver({ type: "control", childId: st.id, token: "RESET-PARENT" });
-    if (report.incr) this.deliver({ type: "control", childId: st.id, token: "INCR-PARENT" });
+    if (report.done) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "DONE-PARENT" });
+    if (report.reset) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "RESET-PARENT" });
+    if (report.incr) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "INCR-PARENT" });
   }
 
   /**
@@ -269,7 +355,7 @@ export class Hub {
     return ring.get(id);
   }
 
-  getChild(id: string): RpcChild | undefined {
+  getChild(id: string): RpcChildHandle | undefined {
     return this.kids.get(id)?.child;
   }
 
@@ -292,7 +378,8 @@ export class Hub {
       return true;
     }
 
-    const child = await RpcChild.spawnChild({
+    const generation = this.generation;
+    const child = await this.spawnChild({
       sessionDir: this.ground.sessions,
       sessionName: `subagent-${id}-resume`,
       provider,
@@ -300,10 +387,21 @@ export class Hub {
       thinking,
       systemPrompt: CHILD_SYSTEM_PROMPT,
     });
-    const sw = await child.send("switch_session", { sessionPath: sessionFile }, 10_000);
+    await this.rejectReplacedSessionChild(generation, child, "resume");
+    let sw;
+    try {
+      sw = await child.send("switch_session", { sessionPath: sessionFile }, 10_000);
+    } catch {
+      if (generation !== this.generation) {
+        await this.rejectReplacedSessionChild(generation, child, "resume");
+      }
+      await this.shutdownUnregisteredChild(child);
+      throw new Error("subagent resume switch failed");
+    }
+    await this.rejectReplacedSessionChild(generation, child, "resume");
     if (!sw.success) {
-      await child.shutdown();
-      throw new Error(`switch_session during resume failed: ${sw.error}`);
+      await this.shutdownUnregisteredChild(child);
+      throw new Error("subagent resume switch failed");
     }
     const st: ChildState = {
       id,
@@ -316,17 +414,21 @@ export class Hub {
       turnCount: view.turnCount,
       compactions: view.compactions,
       finalizedEnds: 0,
+      generation,
     };
     this.kids.set(id, st);
     child.setLineHandler((line) => this.onLine(id, line));
     child.onExit = () => {
       if (!this.kids.has(id)) return;
       this.kids.delete(id);
-      ring.upsert(id, { status: "crashed" });
+      const alreadyFailed = ring.get(id)?.status === "failed";
+      if (!alreadyFailed) ring.upsert(id, { status: "crashed" });
       this.onExit?.(id, "crash");
-      this.deliver({ type: "crash", childId: id, reason: "process exited" });
+      if (!alreadyFailed) {
+        this.deliverFor(st.generation, { type: "crash", childId: id, reason: "process exited" });
+      }
     };
-    ring.upsert(id, { status: "working" });
+    ring.upsert(id, { status: "working", ask: undefined, error: undefined });
     if (prompt) void child.send("prompt", { message: prompt }, 10_000).catch(() => {});
     return true;
   }
@@ -337,14 +439,20 @@ export class Hub {
   }
 
   async shutdownAll(): Promise<void> {
-    const ids = [...this.kids.keys()];
-    for (const id of ids) {
-      const st = this.kids.get(id);
-      if (!st) continue;
-      st.child.setLineHandler(null);
-      await st.child.shutdown();
-      this.kids.delete(id);
-      ring.upsert(id, { status: "killed" });
+    const states = [...this.kids.values()];
+    this.generation += 1;
+    for (const state of states) {
+      state.child.setLineHandler(null);
+      state.child.onExit = null;
     }
+    this.kids.clear();
+    ring.reset();
+    await Promise.all(states.map(async (state) => {
+      try {
+        await state.child.shutdown();
+      } finally {
+        this.onExit?.(state.id, "kill");
+      }
+    }));
   }
 }
