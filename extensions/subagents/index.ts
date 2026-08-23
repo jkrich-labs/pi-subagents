@@ -8,12 +8,12 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { Type } from "typebox";
 import { Ground } from "./ground.ts";
 import { Hub, type Delivery, type SpawnRequest } from "./hub.ts";
-import { LivenessEngine } from "../../liveness/engine.ts";
+import { LivenessEngine } from "./liveness/engine.ts";
 import { ring } from "./ring/store.ts";
 import { routeSteers, stripSteers } from "./route.ts";
-import { renderTicker } from "../../ui/ticker.ts";
-import { shouldConsumeEnter, type SessionEntryLike } from "../../ui/inspect.ts";
-import { openFleetOverlay, openInspectOverlay, openNavigateOverlay } from "../../ui/overlay.ts";
+import { renderTicker } from "./ui/ticker.ts";
+import { shouldConsumeEnter, type SessionEntryLike } from "./ui/inspect.ts";
+import { openFleetOverlay, openInspectOverlay, openNavigateOverlay } from "./ui/overlay.ts";
 import { readFileSync } from "node:fs";
 
 function extractText(msg: Record<string, unknown>): string {

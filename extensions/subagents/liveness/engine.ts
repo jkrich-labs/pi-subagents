@@ -3,14 +3,14 @@
  * orphan reaper into the hub's poll tick. Regime A terminates on
  * process/transport facts only; Regime B (semantics) probes, never kills.
  */
-import { Hub } from "../extensions/subagents/hub.ts";
+import { Hub } from "../hub.ts";
 import { freshHeartbeat, heartbeatTick } from "./heartbeat.ts";
 import { freshStallState, stallStep, shouldProbe, isStalled } from "./stall.ts";
 import { frameFor, isLooping } from "./loop-fingerprint.ts";
 import { probeDecision, type ProbeState } from "./probe.ts";
 import { JsonlTombstones } from "./tombstones.ts";
 import { writePidfile, sweep, pidAlive } from "./orphan-reaper.ts";
-import { ring } from "../extensions/subagents/ring/store.ts";
+import { ring } from "../ring/store.ts";
 
 export interface EngineManifest {
   heartbeat: ReturnType<typeof freshHeartbeat>;

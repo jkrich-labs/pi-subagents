@@ -7,11 +7,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { frameFor, isLooping, nextCooldown } from "../liveness/loop-fingerprint.ts";
-import { freshStallState, isStalled, stallStep, shouldProbe } from "../liveness/stall.ts";
-import { probeDecision, applyKeepGoing } from "../liveness/probe.ts";
-import { freshHeartbeat, heartbeatTick, MISSES_TO_TERMINATE } from "../liveness/heartbeat.ts";
-import { writePidfile, sweep } from "../liveness/orphan-reaper.ts";
+import { frameFor, isLooping, nextCooldown } from "../extensions/subagents/liveness/loop-fingerprint.ts";
+import { freshStallState, isStalled, stallStep, shouldProbe } from "../extensions/subagents/liveness/stall.ts";
+import { probeDecision, applyKeepGoing } from "../extensions/subagents/liveness/probe.ts";
+import { freshHeartbeat, heartbeatTick, MISSES_TO_TERMINATE } from "../extensions/subagents/liveness/heartbeat.ts";
+import { writePidfile, sweep } from "../extensions/subagents/liveness/orphan-reaper.ts";
 import { Ground } from "../extensions/subagents/ground.ts";
 
 test("loop fingerprint flags a 10× repeated tool-multiset+args window; not varied work", () => {
@@ -124,7 +124,7 @@ test("reaper: dead parent's pidfile orphan is reclaimed; live parent untouched",
 test("engine integration: spawn, probe liveness, tombstone on kill", { timeout: 240_000, concurrency: 1 }, async () => {
   const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-live-")));
   const { Hub } = await import("../extensions/subagents/hub.ts");
-  const { LivenessEngine } = await import("../liveness/engine.ts");
+  const { LivenessEngine } = await import("../extensions/subagents/liveness/engine.ts");
   const deliveries: string[] = [];
   const hub = new Hub({ ground, deliver: (d) => deliveries.push(d.type) });
   new LivenessEngine(hub, ground.tombstones);

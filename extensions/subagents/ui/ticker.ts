@@ -3,7 +3,7 @@
  * The TUI widget layer calls this on every ring event (throttled 250ms);
  * the pure function is the unit-tested seam.
  */
-import type { ChildView } from "../extensions/subagents/ring/store.ts";
+import type { ChildView } from "../ring/store.ts";
 
 export interface TickerLine {
   id: string;

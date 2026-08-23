@@ -27,7 +27,7 @@ import {
   type Segment,
   type SessionEntryLike,
 } from "./inspect.ts";
-import type { ChildView } from "../extensions/subagents/ring/store.ts";
+import type { ChildView } from "../ring/store.ts";
 
 const HELP = "↑↓/j/k move • PgUp/PgDn page • g/G top/bottom • c copy entry • q/esc close";
 

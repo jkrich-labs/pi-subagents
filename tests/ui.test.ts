@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatElapsed, renderTicker, renderTickerLine } from "../ui/ticker.ts";
+import { formatElapsed, renderTicker, renderTickerLine } from "../extensions/subagents/ui/ticker.ts";
 import {
   conversationSegments,
   navigator,
@@ -15,7 +15,7 @@ import {
   Pager,
   shouldConsumeEnter,
   type SessionEntryLike,
-} from "../ui/inspect.ts";
+} from "../extensions/subagents/ui/inspect.ts";
 import { blankView, type ChildView } from "../extensions/subagents/ring/store.ts";
 
 function view(patch: Partial<ChildView>): ChildView {
