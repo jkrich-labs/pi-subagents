@@ -3,7 +3,7 @@
  * Boot-time sweep: a child pid whose ppid is dead (or 1/init) is reclaimed.
  * Children of a live parent are untouched. Regime A fact.
  */
-import { readdirSync, readFileSync, existsSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, unlinkSync, writeFileSync, mkdirSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
 
 export interface PidfileEntry {
@@ -12,6 +12,12 @@ export interface PidfileEntry {
   ppid: number;
   sessionFile: string;
   spawnedAt: number;
+  /** Linux process identity captured at launch; never trust a pid alone. */
+  processStartTime?: string;
+  processGroup?: number;
+  executable?: string;
+  parentStartTime?: string;
+  parentExecutable?: string;
 }
 
 export function pidPath(pidsDir: string, childId: string): string {
@@ -38,13 +44,33 @@ export function readPidfile(path: string): PidfileEntry | null {
   }
 }
 
-export function ppidAlive(ppid: number): boolean {
-  if (ppid <= 1) return false; // reparented to init = orphan (for the reaper)
+export interface ProcessIdentity {
+  parentPid: number;
+  processGroup: number;
+  processStartTime: string;
+  executable: string;
+}
+
+export function processIdentity(pid: number): ProcessIdentity | null {
+  if (!Number.isInteger(pid) || pid <= 1) return null;
   try {
-    return existsSync(`/proc/${ppid}`);
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) return null;
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+    const parentPid = Number(fields[1]);
+    const processGroup = Number(fields[2]);
+    const processStartTime = fields[19];
+    const executable = readlinkSync(`/proc/${pid}/exe`);
+    if (!Number.isInteger(parentPid) || !Number.isInteger(processGroup) || !processStartTime || !executable) return null;
+    return { parentPid, processGroup, processStartTime, executable };
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function ppidAlive(ppid: number): boolean {
+  return ppid > 1 && processIdentity(ppid) !== null;
 }
 
 export function pidAlive(pid: number): boolean {
@@ -76,8 +102,25 @@ export function sweep(pidsDir: string, onKill: (pid: number) => void): SweepResu
     if (!f.endsWith(".pid")) continue;
     const e = readPidfile(join(pidsDir, f));
     if (!e) continue;
-    const parentDead = !ppidAlive(e.ppid);
-    if (!parentDead) continue;
+    const identity = processIdentity(e.pid);
+    if (!identity) {
+      // Legacy/stale records may be deleted when the recorded pid is absent,
+      // but a writable record can never authorize a signal without identity.
+      if (!ppidAlive(e.ppid)) {
+        out.reclaimed.push(e.childId);
+        try { unlinkSync(join(pidsDir, f)); } catch { /* already gone */ }
+      }
+      continue;
+    }
+    if (e.processStartTime === undefined || e.processGroup === undefined || e.executable === undefined ||
+        e.parentStartTime === undefined || e.parentExecutable === undefined ||
+        identity.processGroup !== e.processGroup || identity.processStartTime !== e.processStartTime || identity.executable !== e.executable) continue;
+    const originalParent = processIdentity(e.ppid);
+    const parentStillOwner = identity.parentPid === e.ppid && originalParent !== null &&
+      originalParent.processStartTime === e.parentStartTime && originalParent.executable === e.parentExecutable;
+    // A validated child whose original authenticated parent is gone is an
+    // orphan even when a subreaper adopted it with a new live PPID.
+    if (parentStillOwner) continue;
     if (pidAlive(e.pid)) onKill(e.pid);
     out.reclaimed.push(e.childId);
     try {

@@ -1,0 +1,8 @@
+{
+  "name": "parallel-diagnosis-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "verify": "node verifier.mjs"
+  }
+}

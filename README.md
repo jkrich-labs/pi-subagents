@@ -29,6 +29,52 @@ make unit          # pure unit tests only — no children, no provider auth
 make smoke         # scripted PTY smoke of the TUI (scripts/smoke-tui.py)
 ```
 
+## Benchmark suite and pi-autoresearch
+
+The opt-in authenticated suite uses the bundled manifest policy and runs
+parallel diagnosis, isolated parallel implementation, and review convergence
+from clean fixtures. It can incur provider cost; it is not part of ordinary unit CI.
+
+```bash
+# One complete, approximately five-minute target sample and strict raw KPI output.
+npm run benchmark:subagents -- --profile quick --format autoresearch \
+  --output /tmp/pi-subagents-benchmark.json
+
+# Three independently reset samples; JSON contains per-sample records, medians, and MADs.
+npm run benchmark:subagents -- --profile confirm --format json \
+  --output /tmp/pi-subagents-benchmark-confirm.json
+```
+
+`wall_time_ms`, `total_tokens`, and `tool_failures` are independent,
+lower-is-better KPIs. Autoresearch output has exactly one finite `METRIC` line
+for each only after every correctness, policy, autonomous-completion, scope,
+fixture, and cleanup hard gate passes; it never produces a composite score.
+JSON artifacts are atomically written and contain the active manifest,
+suite/model-policy digests, observed process launch trace, all scenario gates,
+raw sample values, and median/MAD summaries. Fixture verification runs with
+Node permissions, frozen intrinsics, and a separate verifier guard; fixture
+and scoring paths are protected from candidate edits.
+
+Protect benchmark inputs and scoring from candidate edits in a pi-autoresearch
+run specification, for example:
+
+```json
+{
+  "protectedPaths": [
+    "harness/benchmark/**",
+    "harness/rpc-child.ts",
+    "extensions/subagents/**",
+    "tests/benchmark-*.test.ts",
+    "package.json",
+    ".npmrc"
+  ],
+  "evaluator": "npm run benchmark:subagents -- --profile quick --format autoresearch --output /tmp/pi-subagents-benchmark.json"
+}
+```
+
+Use `npm run benchmark:subagents -- --help` for profiles, diagnostic
+single-scenario commands, output paths, cost, and hard-gate details.
+
 ## Install the hub
 
 ```bash

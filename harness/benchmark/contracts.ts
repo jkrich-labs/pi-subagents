@@ -5,6 +5,18 @@ export const BENCHMARK_SAMPLE_SCHEMA_VERSION = 1 as const;
 
 export type BenchmarkParticipant = "parent" | "child";
 
+/** Bounded process-level launch evidence retained without model transcript content. */
+export interface BenchmarkLaunchTrace {
+  scenarioId: string;
+  participant: BenchmarkParticipant;
+  id: string;
+  pid: number;
+  startedAt: number;
+  provider: string;
+  model: string;
+  thinking: string;
+}
+
 /** The exact model configuration one benchmark participant is allowed to use. */
 export interface ModelPolicy {
   provider: string;
@@ -76,6 +88,7 @@ export interface BenchmarkSample {
   usage: UsageBreakdown;
   cacheHitRate: number;
   scenarios: readonly ScenarioResult[];
+  launchTrace: readonly BenchmarkLaunchTrace[];
   qualityGates: readonly QualityGateResult[];
   diagnostics: readonly BenchmarkDiagnostic[];
   diagnosticsDropped: number;
@@ -238,6 +251,7 @@ export interface CreateBenchmarkSampleInput {
   accounting: SessionAccounting;
   scenarios: readonly ScenarioInput[];
   qualityGates?: readonly QualityGateResult[];
+  launchTrace?: readonly BenchmarkLaunchTrace[];
 }
 
 /**
@@ -311,6 +325,7 @@ export function createBenchmarkSample(input: CreateBenchmarkSampleInput): Benchm
       usage: { ...scenario.usage },
       qualityGates: [...scenario.qualityGates],
     })),
+    launchTrace: [...(input.launchTrace ?? [])],
     qualityGates: [...(input.qualityGates ?? []), accountingGate],
     diagnostics: [...input.accounting.diagnostics],
     diagnosticsDropped: input.accounting.diagnosticsDropped,

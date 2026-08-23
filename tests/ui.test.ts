@@ -18,6 +18,7 @@ import {
 import { blankView, ring, type ChildView } from "../extensions/subagents/ring/store.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { openFleetOverlay } from "../extensions/subagents/ui/overlay.ts";
+import { makeAskLens, makeCompletionLens } from "../extensions/subagents/lenses.ts";
 import subagentsExtension, {
   mapTaskRequest,
   parentBashGuard,
@@ -519,29 +520,38 @@ test("extension prevents parent polling and exposes Cursor-compatible delegation
   ring.reset();
 });
 
-test("final child reports become model-visible exactly once", () => {
+test("final child reports become one bounded model-visible wake-up without a retry loop", () => {
   const entries: Array<{ type: string; data: unknown }> = [];
   const messages: Array<{ text: string; options: unknown }> = [];
   const pi = {
     appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
     sendUserMessage(text: string, options: unknown) { messages.push({ text, options }); },
   } as any;
-  const lens = {
-    type: "completion" as const,
-    childId: "review-child",
-    ref: "review-child",
-    sessionPath: "/sessions/review.jsonl",
-    digest: "Standards report: one blocking lifecycle defect.",
-    lastTurnAt: 123,
-  };
+  const lens = makeCompletionLens(
+    "review-child",
+    Array.from({ length: 220 }, (_, index) => `report-${index}`).join(" "),
+    "/sessions/review.jsonl",
+    123,
+  );
 
+  assert.ok(lens.digest.split(/\s+/).length <= 151, "display/history lenses retain the bounded digest rather than a transcript");
+  assert.ok(makeCompletionLens("long-child", "x".repeat(1_000_000), "/sessions/long.jsonl").digest.length <= 4002, "a no-whitespace report is bounded by bytes as well as words");
   deliverToParent(pi, { type: "lens", lens, final: false });
   assert.equal(messages.length, 0, "progress lenses do not wake the parent");
   deliverToParent(pi, { type: "lens", lens, final: true });
-  assert.equal(entries.filter((entry) => entry.type === "subagent_lens").length, 2);
-  assert.equal(messages.length, 1, "DONE report is delivered once as model-visible follow-up");
-  assert.match(messages[0].text, /review-child.*COMPLETED.*blocking lifecycle defect/is);
-  assert.deepEqual(messages[0].options, { deliverAs: "steer" });
+  deliverToParent(pi, {
+    type: "control",
+    childId: "review-child",
+    token: "DONE-PARENT",
+    reportDelivered: true,
+  });
+  assert.equal(entries.filter((entry) => entry.type === "subagent_lens").length, 2, "display history retains only bounded lens records");
+  assert.equal(entries.filter((entry) => entry.type === "subagent_done").length, 1, "DONE history remains a small control record");
+  assert.equal(messages.length, 1, "DONE report is delivered once as a model-visible follow-up");
+  assert.match(messages[0].text, /review-child.*COMPLETED.*report-0/is);
+  assert.ok(messages[0].text.split(/\s+/).length <= 155, "the waking follow-up remains bounded");
+  assert.doesNotMatch(messages[0].text, /retry|spawn/i, "completion delivery cannot start a retry loop");
+  assert.deepEqual(messages[0].options, { deliverAs: "steer" }, "a steer wakes an idle parent");
 
   deliverToParent(pi, {
     type: "control",
@@ -552,6 +562,19 @@ test("final child reports become model-visible exactly once", () => {
   assert.equal(messages.length, 2, "token-only completion wakes the parent");
   assert.match(messages[1].text, /empty-report-child.*COMPLETED.*no textual report/i);
   assert.deepEqual(messages[1].options, { deliverAs: "steer" });
+});
+
+test("ASK follow-ups use the same bounded digest policy", () => {
+  const messages: Array<{ text: string; options: unknown }> = [];
+  const pi = {
+    appendEntry() {},
+    sendUserMessage(text: string, options: unknown) { messages.push({ text, options }); },
+  } as any;
+  const ask = makeAskLens("ask-child", "x".repeat(1_000_000), "/sessions/ask.jsonl");
+  deliverToParent(pi, { type: "ask", childId: "ask-child", question: ask.question });
+  assert.equal(messages.length, 1);
+  assert.ok(messages[0].text.length <= 4100, "ASK follow-ups do not forward an unbounded child line");
+  assert.deepEqual(messages[0].options, { deliverAs: "steer" });
 });
 
 test("child failures become model-visible follow-up messages", () => {
@@ -610,6 +633,9 @@ test("parent bash guard blocks raw delegation, polling, and hub-owned kills", ()
     reason: "Do not launch nested pi agents through bash or manage their PID files. Use Task/spawn_subagent with cwd instead.",
   }, "a blocked raw launch returns control so the parent can delegate correctly");
   assert.equal(parentBashGuard("pi --list-models", false, () => false), undefined, "non-agent pi diagnostics remain available");
+  for (const command of ["bash -c 'pi --mode rpc'", "env pi --mode rpc", "sh -c 'exec pi --mode rpc'", "bash -c \"$(which pi) --mode rpc\"", "${PI_BIN:-pi} --mode rpc", "p$(printf i) --mode rpc", "$(printf '\\160\\151') --mode rpc", "$'\\x70\\x69' --mode rpc", "p$'\\u0069' --mode rpc", "$(printf p)$(printf i) --mode rpc", "printf '\\160\\151 --mode rpc' | sh", "P=pi;$P --mode rpc", "command \\pi --mode rpc"]) {
+    assert.equal(parentBashGuard(command, false, () => false)?.block, true, `wrapped nested pi is blocked: ${command}`);
+  }
 });
 
 test("fleet overlay stays active through a selected child inspection", async () => {

@@ -24,6 +24,26 @@ export interface SpawnRequest {
   cwd?: string;
 }
 
+/**
+ * Runner-supplied child settings for an opt-in benchmark only. They bypass
+ * interactive preset resolution after the preset has supplied its role prompt.
+ */
+export interface BenchmarkChildLaunchPolicy {
+  provider: string;
+  model: string;
+  thinking: string;
+}
+
+function validateBenchmarkChildPolicy(policy: BenchmarkChildLaunchPolicy): BenchmarkChildLaunchPolicy {
+  const provider = policy.provider?.trim();
+  const model = policy.model?.trim();
+  const thinking = policy.thinking?.trim();
+  if (!provider || !model || !thinking) {
+    throw new Error("benchmark child policy requires non-empty provider, model, and thinking values");
+  }
+  return { provider, model, thinking };
+}
+
 export type Delivery =
   | { type: "lens"; lens: Lens; final: boolean }
   | { type: "ask"; childId: string; question: string }
@@ -52,8 +72,11 @@ interface ChildState {
   generation: number;
   pendingTurnError?: string;
   pendingTurnMessage?: Record<string, unknown>;
+  busy: boolean;
+  steerQueued: boolean;
   idleReapTimer?: ReturnType<typeof setTimeout>;
   reaping?: boolean;
+  terminating?: boolean;
 }
 
 export const CHILD_SYSTEM_PROMPT = [
@@ -116,10 +139,19 @@ interface ResolvedLaunch {
   toolPolicy: AgentToolPolicy;
 }
 
-function resolveLaunch(req: SpawnRequest): ResolvedLaunch {
+function resolveLaunch(req: SpawnRequest, benchmarkChildPolicy?: BenchmarkChildLaunchPolicy): ResolvedLaunch {
+  const applyBenchmarkPolicy = (launch: ResolvedLaunch): ResolvedLaunch => benchmarkChildPolicy
+    ? {
+      ...launch,
+      provider: benchmarkChildPolicy.provider,
+      model: benchmarkChildPolicy.model,
+      thinking: benchmarkChildPolicy.thinking,
+    }
+    : launch;
+
   if (req.agent?.trim()) {
     const named = agentRegistry.resolve(req.agent, req);
-    return {
+    return applyBenchmarkPolicy({
       title: req.title?.trim() || named.name,
       agent: named.name,
       cwd: req.cwd,
@@ -128,13 +160,13 @@ function resolveLaunch(req: SpawnRequest): ResolvedLaunch {
       thinking: named.thinking,
       systemPrompt: named.systemPrompt,
       toolPolicy: named.toolPolicy,
-    };
+    });
   }
 
   const title = req.title?.trim();
   if (!title) throw new Error("generic subagent spawn requires a non-empty title");
   const general = agentRegistry.resolve("general-purpose", req);
-  return {
+  return applyBenchmarkPolicy({
     title,
     agent: general.name,
     cwd: req.cwd,
@@ -143,7 +175,7 @@ function resolveLaunch(req: SpawnRequest): ResolvedLaunch {
     thinking: general.thinking,
     systemPrompt: general.systemPrompt,
     toolPolicy: general.toolPolicy,
-  };
+  });
 }
 
 function titleKey(title: string): string {
@@ -159,6 +191,7 @@ export class Hub {
   private readonly deliver: (d: Delivery) => void;
   private readonly spawnChild: (options: RpcChildOptions) => Promise<RpcChildHandle>;
   private readonly idleReapMs: number;
+  private readonly benchmarkChildPolicy?: BenchmarkChildLaunchPolicy;
   private readonly kids = new Map<string, ChildState>();
   private readonly unsupportedSelections = new Set<string>();
   private generation = 0;
@@ -183,12 +216,15 @@ export class Hub {
     ground?: Ground;
     deliver: (d: Delivery) => void;
     spawnChild?: (options: RpcChildOptions) => Promise<RpcChildHandle>;
+    /** Explicit runner policy; absent for all ordinary interactive launches. */
+    benchmarkChildPolicy?: BenchmarkChildLaunchPolicy;
     /** Grace period during which a completed child can receive a follow-up. */
     idleReapMs?: number;
   }) {
     this.ground = opts.ground ?? new Ground();
     this.deliver = opts.deliver;
     this.spawnChild = opts.spawnChild ?? RpcChild.spawnChild;
+    this.benchmarkChildPolicy = opts.benchmarkChildPolicy && validateBenchmarkChildPolicy(opts.benchmarkChildPolicy);
     this.idleReapMs = opts.idleReapMs ?? DEFAULT_IDLE_REAP_MS;
     if (!Number.isFinite(this.idleReapMs) || this.idleReapMs < 0) {
       throw new Error("idleReapMs must be a finite, non-negative number");
@@ -238,7 +274,7 @@ export class Hub {
     }
     const prompt = req.prompt.trim();
     if (!prompt) throw new Error("subagent spawn requires a non-empty prompt");
-    const launch = resolveLaunch({ ...req, prompt });
+    const launch = resolveLaunch({ ...req, prompt }, this.benchmarkChildPolicy);
     if (this.unsupportedSelections.has(launchKey(launch.provider, launch.model))) {
       throw new Error(
         `subagent launch blocked: ${launch.provider}/${launch.model} already failed as unsupported; choose a supported preset instead of retrying`,
@@ -289,11 +325,17 @@ export class Hub {
       compactions: 0,
       finalizedEnds: 0,
       generation,
+      busy: true,
+      steerQueued: false,
     };
     this.kids.set(id, state);
     child.setLineHandler((line) => this.onLine(id, line));
     child.onExit = () => {
       if (this.kids.get(id)?.child !== child) return;
+      if (state.terminating) {
+        this.kids.delete(id);
+        return;
+      }
       if (state.reaping) {
         this.kids.delete(id);
         this.onExit?.(id, "idle-reap");
@@ -373,6 +415,8 @@ export class Hub {
         ring.upsert(id, { compactions: st.compactions });
         break;
       case "agent_settled":
+        st.busy = false;
+        st.steerQueued = false;
         this.finalize(st);
         break;
       default:
@@ -459,7 +503,11 @@ export class Hub {
 
     if (report.ask) {
       ring.upsert(st.id, { status: "asking", ask: report.ask, error: undefined });
-      this.deliverFor(st.generation, { type: "ask", childId: st.id, question: report.ask });
+      this.deliverFor(st.generation, {
+        type: "ask",
+        childId: st.id,
+        question: makeAskLens(st.id, report.ask, st.sessionFile).question,
+      });
       return;
     }
 
@@ -511,10 +559,12 @@ export class Hub {
       if (!st || !st.child.isRunning()) continue;
       const status = ring.get(id)?.status;
       if (status !== undefined && !ACTIVE_STATUSES.has(status) && status !== "done") continue;
-      any = true;
       const wasIdle = status === "done";
+      const busy = st.busy;
+      if (busy && st.steerQueued) continue;
+      any = true;
+      const finalizedBefore = st.finalizedEnds;
       if (wasIdle) this.cancelIdleReap(st);
-      const busy = st.child.events("agent_end").length > st.child.events("agent_settled").length;
       let accepted: CommandResponse;
       try {
         accepted = await st.child.send(busy ? "steer" : "prompt", { message: text }, 10_000);
@@ -527,8 +577,12 @@ export class Hub {
         if (accepted.error) throw new Error(`steer ${id} failed: ${accepted.error}`);
         continue;
       }
-      if (this.kids.get(id) === st) {
+      if (this.kids.get(id) === st && st.finalizedEnds === finalizedBefore) {
+        st.busy = true;
+        if (busy) st.steerQueued = true;
         ring.upsert(id, { status: "working", ask: undefined, error: undefined });
+      } else if (wasIdle && this.kids.get(id) === st) {
+        this.scheduleIdleReap(st);
       }
     }
     return any;
@@ -543,7 +597,12 @@ export class Hub {
     const st = this.kids.get(id);
     if (!st) return;
     this.cancelIdleReap(st);
+    // A killed handle may still flush buffered lines after SIGTERM. Detach
+    // both callbacks before a same-id resume can install its replacement.
+    st.child.setLineHandler(() => {});
+    st.child.onExit = null;
     try {
+      st.terminating = true;
       st.child.kill();
       await st.child.shutdown();
     } finally {
@@ -592,7 +651,7 @@ export class Hub {
 
     // Delete tombstones? The tombstone stays as a historical fact; the new
     // incarnation is the resumed session.
-    const selection = resolveSpawn({
+    const selection = this.benchmarkChildPolicy ?? resolveSpawn({
       model: view.model,
       provider: view.provider,
       thinking: view.thinking,
@@ -650,11 +709,17 @@ export class Hub {
       compactions: view.compactions,
       finalizedEnds: 0,
       generation,
+      busy: Boolean(prompt),
+      steerQueued: false,
     };
     this.kids.set(id, st);
     child.setLineHandler((line) => this.onLine(id, line));
     child.onExit = () => {
       if (this.kids.get(id)?.child !== child) return;
+      if (st.terminating) {
+        this.kids.delete(id);
+        return;
+      }
       if (st.reaping) {
         this.kids.delete(id);
         this.onExit?.(id, "idle-reap");

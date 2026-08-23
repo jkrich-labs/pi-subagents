@@ -9,7 +9,7 @@ import { freshStallState, stallStep, shouldProbe, isStalled } from "./stall.ts";
 import { frameFor, isLooping } from "./loop-fingerprint.ts";
 import { probeDecision, type ProbeState } from "./probe.ts";
 import { JsonlTombstones } from "./tombstones.ts";
-import { writePidfile, removePidfile, sweep, pidAlive } from "./orphan-reaper.ts";
+import { writePidfile, removePidfile, sweep, pidAlive, processIdentity } from "./orphan-reaper.ts";
 import { ring } from "../ring/store.ts";
 
 export interface EngineManifest {
@@ -42,14 +42,23 @@ export class LivenessEngine {
       window: [],
     });
     const child = this.hub.getChild(id);
-    if (child) {
-      writePidfile(this.hub.ground.pids, {
-        childId: id,
-        pid: child.proc.pid ?? -1,
-        ppid: process.pid,
-        sessionFile: view?.sessionFile ?? "",
-        spawnedAt: Date.now(),
-      });
+    if (child?.proc.pid) {
+      const identity = processIdentity(child.proc.pid);
+      const parentIdentity = processIdentity(process.pid);
+      if (identity && parentIdentity && identity.parentPid === process.pid) {
+        writePidfile(this.hub.ground.pids, {
+          childId: id,
+          pid: child.proc.pid,
+          ppid: process.pid,
+          sessionFile: view?.sessionFile ?? "",
+          spawnedAt: Date.now(),
+          processStartTime: identity.processStartTime,
+          processGroup: identity.processGroup,
+          executable: identity.executable,
+          parentStartTime: parentIdentity.processStartTime,
+          parentExecutable: parentIdentity.executable,
+        });
+      }
     }
   }
 

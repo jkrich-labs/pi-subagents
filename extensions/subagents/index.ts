@@ -8,6 +8,7 @@ import { CustomEditor, type ExtensionAPI, type ExtensionCommandContext } from "@
 import { Type } from "typebox";
 import { Ground } from "./ground.ts";
 import { Hub, type Delivery, type SpawnRequest } from "./hub.ts";
+import { benchmarkChildPolicyFromEnvironment } from "./benchmark-policy.ts";
 import { LivenessEngine } from "./liveness/engine.ts";
 import { ring } from "./ring/store.ts";
 import { routeSteers, stripSteers } from "./route.ts";
@@ -58,12 +59,30 @@ function killTargets(command: string): number[] {
 }
 
 function launchesNestedPi(command: string): boolean {
-  return command.split(/[;&|()\n]+/).some((part) => {
-    const invocation = /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|command|exec|nohup)\s+)*(?:\S*\/)?pi(?:\s+|$)(.*)$/is.exec(part);
-    if (!invocation) return false;
-    const args = invocation[1].trim();
-    return !/^(?:--help|-h|--version|-v|--list-models)(?:\s|$)/.test(args);
-  });
+  const raw = command;
+  const normalized = command.replace(/["']/g, " ");
+  const direct = /(?:^|[;&|()\n]\s*)(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|command|exec|nohup|env)\s+)*(?:\S*\/)?pi(?:\s+|$)(.*)$/is.exec(normalized);
+  if (direct) {
+    return !/^(?:--help|-h|--version|-v|--list-models)(?:\s|$)/.test(direct[1].trim());
+  }
+  // Shell wrappers (`bash -c`, `env`, `sh -c 'exec pi …'`) hide the
+  // executable from the direct-command expression above. Treat any wrapped
+  // pi invocation as nested delegation rather than letting it escape policy.
+  return /\$\(/.test(raw) ||
+    /\b[A-Za-z_]\w*\$[A-Za-z_]\w*/.test(raw) ||
+    /(?:^|[;&|])[^\n;|]*\b[A-Za-z_]\w*=\S+\s*;[^\n;|]*\$[A-Za-z_]/.test(raw) ||
+    /(?:^|[\s;&|()])(?:\S*\/)?pi(?=\s|$)/i.test(normalized) ||
+    /\$\{[^}]*\bpi\b[^}]*\}/i.test(normalized) ||
+    /\$\([^)]*\bpi\b[^)]*\)/i.test(normalized) ||
+    /\$\([^)]*\b(?:printf|echo)\b/i.test(normalized) ||
+    /\$'[^']*(?:\\x[0-9a-f]{2}|\\u[0-9a-f]{4}|\\[0-7]{3})/i.test(raw) ||
+    /(?:^|[\s;&|()])p["'\\\s]*i(?=\s|$)/i.test(raw) ||
+    /\b[A-Za-z_]\w*\s*=\s*(?:["']?)(?:\S*\/)?pi(?:["']?)(?=\s|;|$)/i.test(raw) ||
+    /(?:^|[;&|])\s*\$\{?[A-Za-z_]\w*/.test(raw) ||
+    /\$(?:\{)?PI(?:_BIN)?\}?\b/i.test(raw) ||
+    /(?:printf|echo)[^|]*(?:\\[0-7]{3}|\\x[0-9a-f]{2})[^|]*\|\s*(?:sh|bash)\b/i.test(raw) ||
+    /\\pi\b/i.test(normalized) ||
+    /p\$\([^)]*(?:printf|echo)\s+i\b/i.test(normalized);
 }
 
 export function parentBashGuard(
@@ -106,11 +125,11 @@ export function spawnSuccessText(id: string, label: string): string {
   ].join(" ");
 }
 
-export function spawnToolResult(id: string, label: string, agent?: string): SpawnToolResult {
+export function spawnToolResult(id: string, label: string, agent?: string, terminate = true): SpawnToolResult {
   return {
     content: [{ type: "text", text: spawnSuccessText(id, label) }],
     details: { childId: id, agent },
-    terminate: true,
+    ...(terminate ? { terminate: true } : {}),
   };
 }
 
@@ -125,8 +144,15 @@ function extractText(msg: Record<string, unknown>): string {
 
 export default function (pi: ExtensionAPI) {
   const ground = new Ground();
-  const hub = new Hub({ ground, deliver: (d: Delivery) => deliverToParent(pi, d) });
+  const hub = new Hub({
+    ground,
+    deliver: (d: Delivery) => deliverToParent(pi, d),
+    benchmarkChildPolicy: benchmarkChildPolicyFromEnvironment(),
+  });
   const engine = new LivenessEngine(hub, ground.tombstones);
+  // The authenticated parallel benchmark is opt-in. Normal interactive and
+  // autonomous-smoke launches retain the terminate-after-spawn behavior.
+  const benchmarkParallelDelegation = process.env.PI_SUBAGENTS_BENCHMARK_PARALLEL_DELEGATION === "1";
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let stopTui: (() => void) | null = null;
 
@@ -154,7 +180,7 @@ export default function (pi: ExtensionAPI) {
       const id = await hub.spawn(request);
       const view = hub.getView(id);
       const label = request.title?.trim() || view?.agent || "subagent";
-      return spawnToolResult(id, label, view?.agent);
+      return spawnToolResult(id, label, view?.agent, !benchmarkParallelDelegation);
     } catch (error) {
       return {
         content: [{

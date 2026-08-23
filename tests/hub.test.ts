@@ -197,6 +197,10 @@ test("hub: rejects a retry title while the original child is still live", async 
   const hub = new Hub({ ground: tmpGround(), deliver: () => {}, spawnChild: recorder.spawnChild });
 
   const id = await hub.spawn({ title: "Review S-01 standards", prompt: "Review" });
+  assert.equal(await hub.steer(id, "prioritize the blocking finding"), true);
+  assert.equal(recorder.commands.at(-1)?.command, "steer", "an active child receives steering rather than a fresh prompt");
+  assert.equal(await hub.steer(id, "do not queue a second steer"), false, "only one steer may be queued before settlement");
+  assert.equal(recorder.commands.filter((command) => command.command === "steer").length, 1);
   await assert.rejects(
     hub.spawn({ title: "Review S-01 standards retry", prompt: "Review again" }),
     new RegExp(`already working.*${id}`, "i"),
@@ -229,6 +233,40 @@ test("hub: a completed child can be steered again while it remains idle", async 
     assert.equal(recorder.commands.at(-1)?.command, "prompt", "settled children receive a fresh prompt");
     assert.equal(recorder.commands.at(-1)?.body.message, "continue from the first pass");
     assert.equal(hub.getView(id)?.status, "working", "a resumed child is visible as active");
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: duplicate DONE settlement emits one final delivery and never retries the child", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: (delivery) => deliveries.push(delivery), spawnChild: recorder.spawnChild });
+
+  try {
+    const id = await hub.spawn({ title: "final-once", prompt: "Complete once" });
+    const assistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "Bounded final report\nDONE-PARENT" }],
+      stopReason: "stop",
+    };
+    const emit = recorder.handlers[0];
+    assert.ok(emit);
+    emit({ type: "turn_end", message: assistant });
+    emit({ type: "agent_end", messages: [assistant] });
+    emit({ type: "agent_settled" });
+    emit({ type: "agent_settled" });
+
+    assert.equal(hub.getView(id)?.status, "done");
+    assert.equal(deliveries.filter((delivery) => delivery.type === "lens").length, 1, "only one completion lens reaches the delivery seam");
+    assert.equal(
+      deliveries.filter((delivery) => delivery.type === "control" && delivery.token === "DONE-PARENT").length,
+      1,
+      "only one DONE control reaches the delivery seam",
+    );
+    assert.equal(recorder.commands.filter((command) => command.command === "prompt").length, 1, "completion does not issue a retry prompt");
+    assert.equal(recorder.commands.filter((command) => command.command === "steer").length, 0, "completion does not steer a retry loop");
   } finally {
     await hub.shutdownAll();
   }
@@ -295,6 +333,33 @@ test("hub: reports ownership only for live child PIDs", async () => {
   assert.equal(hub.ownsProcess(99_999), false);
   await hub.kill(id);
   assert.equal(hub.ownsProcess(10_001), false);
+});
+
+test("hub: intentional kill does not deliver a crash first", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  let running = true;
+  const child: RpcChildHandle = {
+    proc: { pid: 10_050 },
+    lines: [],
+    sessionFile: "/sessions/kill-race.jsonl",
+    onExit: null,
+    setLineHandler() {},
+    async send(command: string): Promise<CommandResponse> { return { command, success: true }; },
+    events() { return []; },
+    isRunning() { return running; },
+    kill() {
+      running = false;
+      child.onExit?.();
+    },
+    async shutdown() { running = false; },
+  };
+  const hub = new Hub({ ground: tmpGround(), deliver: (delivery) => deliveries.push(delivery), spawnChild: async () => child });
+  const id = await hub.spawn({ title: "kill-race", prompt: "work" });
+  await hub.kill(id);
+  assert.equal(hub.getView(id)?.status, "killed");
+  assert.equal(deliveries.some((delivery) => delivery.type === "crash"), false);
+  await hub.shutdownAll();
 });
 
 test("hub: session shutdown suppresses stale-context delivery and clears the old fleet", async () => {

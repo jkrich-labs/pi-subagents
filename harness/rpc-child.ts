@@ -29,7 +29,13 @@ export interface RpcChildOptions {
   provider?: string;
   model?: string;
   thinking?: string;
+  /** Harness probes default to no tools; a benchmark parent needs extension tools. */
+  tools?: "none" | "normal";
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
   extraArgs?: string[];
+  /** Give authenticated benchmark parents their own process group for cleanup. */
+  detached?: boolean;
 }
 
 export class RpcChild {
@@ -41,6 +47,7 @@ export class RpcChild {
   private buffered = "";
   private procExited = false;
   private idSeq = 0;
+  private readonly lineListeners = new Set<(line: WireLine) => void>();
 
   private constructor(proc: ChildProcessWithoutNullStreams, sessionDir: string) {
     this.proc = proc;
@@ -56,16 +63,16 @@ export class RpcChild {
     });
   }
 
-  static async spawnAndWaitReady(opts: RpcChildOptions): Promise<RpcChild> {
+  static async spawnAndWaitReady(opts: RpcChildOptions, signal?: AbortSignal): Promise<RpcChild> {
     const args = [
       "--mode", "rpc",
-      "--no-tools",
       "--no-extensions",
       "--no-skills",
       "--no-prompt-templates",
       "--no-themes",
       "--no-context-files",
     ];
+    if (opts.tools !== "normal") args.splice(2, 0, "--no-tools");
     if (opts.sessionDir) args.push("--session-dir", opts.sessionDir);
     if (opts.name) args.push("--name", opts.name);
     if (opts.provider) args.push("--provider", opts.provider);
@@ -73,10 +80,20 @@ export class RpcChild {
     if (opts.thinking) args.push("--thinking", opts.thinking);
     if (opts.extraArgs) args.push(...opts.extraArgs);
 
-    const proc = spawn("pi", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const proc = spawn("pi", args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: opts.detached ?? false,
+    });
     const child = new RpcChild(proc, opts.sessionDir);
     child.attachDiagnostics();
+    const abortChild = (): void => {
+      try { if (!proc.killed) proc.kill("SIGTERM"); } catch { /* already gone */ }
+    };
+    signal?.addEventListener("abort", abortChild, { once: true });
     try {
+      if (signal?.aborted) throw new Error("rpc child launch cancelled");
       const r = await child.send("get_state", {}, 8000);
       if (!r.success) throw new Error(`get_state at spawn failed: ${r.error}`);
     } catch (e) {
@@ -84,6 +101,8 @@ export class RpcChild {
         proc.kill("SIGKILL");
       } catch { /* already gone */ }
       throw e instanceof Error ? e : new Error(String(e));
+    } finally {
+      signal?.removeEventListener("abort", abortChild);
     }
     return child;
   }
@@ -109,6 +128,7 @@ export class RpcChild {
         try {
           const parsed: WireLine = JSON.parse(line);
           this.lines.push(parsed);
+          for (const listener of this.lineListeners) listener(parsed);
           if (parsed.type === "response" && parsed.id) {
             const p = this.pending.get(String(parsed.id));
             if (p) {
@@ -173,6 +193,12 @@ export class RpcChild {
       };
       this.proc.stdout.on("data", handler);
     });
+  }
+
+  /** Subscribe to parsed protocol lines without retaining transcript data elsewhere. */
+  onLine(listener: (line: WireLine) => void): () => void {
+    this.lineListeners.add(listener);
+    return () => this.lineListeners.delete(listener);
   }
 
   /** Count lines matching a predicate. */

@@ -32,10 +32,13 @@ export interface StallLens {
 
 export type Lens = CompletionLens | AskLens | StallLens;
 
+const MAX_DIGEST_CHARS = 4000;
+
 function truncateWords(text: string, words: number): string {
   const parts = text.trim().split(/\s+/);
-  if (parts.length <= words) return text.trim();
-  return `${parts.slice(0, words).join(" ")} …`;
+  const wordBounded = parts.length <= words ? text.trim() : `${parts.slice(0, words).join(" ")} …`;
+  if (wordBounded.length <= MAX_DIGEST_CHARS) return wordBounded;
+  return `${wordBounded.slice(0, MAX_DIGEST_CHARS).trimEnd()} …`;
 }
 
 /** Per-turn digest: at most ~150 words of the child's final text. */

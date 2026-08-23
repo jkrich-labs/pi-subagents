@@ -253,7 +253,11 @@ export function accountPersistedSessions(
         continue;
       }
       if (message.role === "toolResult") {
-        if (message.isError === true) sessionToolFailures += 1;
+        if (typeof message.isError !== "boolean") {
+          addDiagnostic("malformed-tool-result", "tool result is missing a boolean isError field");
+        } else if (message.isError) {
+          sessionToolFailures += 1;
+        }
         if (message.usage !== undefined) addUsage(sessionUsage, session.participant, message.usage);
       }
     }
