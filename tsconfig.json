@@ -24,6 +24,14 @@
     "extensions/subagents/lenses.ts",
     "extensions/subagents/registry.ts",
     "extensions/subagents/hub.ts",
-    "extensions/subagents/index.ts"
+    "extensions/subagents/index.ts",
+    "liveness/loop-fingerprint.ts",
+    "liveness/stall.ts",
+    "liveness/probe.ts",
+    "liveness/heartbeat.ts",
+    "liveness/tombstones.ts",
+    "liveness/orphan-reaper.ts",
+    "liveness/engine.ts",
+    "tests/liveness.test.ts"
   ]
 }

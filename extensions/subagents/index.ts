@@ -4,10 +4,11 @@
  * assistant text), and delivers child lenses to the parent transcript via
  * appendEntry. Headless-safe: UI calls are gated on ctx.mode === "tui".
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Ground } from "./ground.ts";
 import { Hub, type Delivery, type SpawnRequest } from "./hub.ts";
+import { LivenessEngine } from "../../liveness/engine.ts";
 import { ring } from "./ring/store.ts";
 import { routeSteers, stripSteers } from "./route.ts";
 
@@ -23,10 +24,16 @@ function extractText(msg: Record<string, unknown>): string {
 export default function (pi: ExtensionAPI) {
   const ground = new Ground();
   const hub = new Hub({ ground, deliver: (d: Delivery) => deliverToParent(pi, d) });
+  const engine = new LivenessEngine(hub, ground.tombstones);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+  const poll = (): void => {
+    hub.poll();
+    engine.tick();
+  };
+
   pi.on("session_start", () => {
-    if (pollTimer === null) pollTimer = setInterval(() => hub.poll(), 1000);
+    if (pollTimer === null) pollTimer = setInterval(poll, 1000);
   });
 
   pi.on("session_shutdown", () => {
@@ -133,6 +140,14 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("subagents", kids > 0 ? `subagents: ${kids}` : undefined);
     }
   });
+
+  // `/subagent` user command.
+  pi.registerCommand("subagent", {
+    description: "Manage the subagent fleet: spawn|list|steer|kill|resume|inspect",
+    handler: async (args, ctx) => {
+      await subagentCommand(pi, hub, ctx, args);
+    },
+  });
 }
 
 function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
@@ -151,5 +166,59 @@ function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
     case "crash":
       pi.appendEntry("subagent_crash", { childId: d.childId, reason: d.reason, at: Date.now() });
       break;
+  }
+}
+
+/**
+ * `/subagent <cmd> <args…>` — spawn|list|steer|kill|resume|inspect.
+ */
+async function subagentCommand(pi: ExtensionAPI, hub: Hub, ctx: ExtensionCommandContext, args: string): Promise<void> {
+  const [cmd, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+  const restStr = rest.join(" ");
+  switch (cmd) {
+    case "spawn": {
+      const title = rest[0] ?? "untitled";
+      const prompt = rest.slice(1).join(" ");
+      if (prompt.length === 0) {
+        ctx.ui.notify("/subagent spawn <title> <prompt>", "warning");
+        return;
+      }
+      const id = await hub.spawn({ title, prompt });
+      ctx.ui.notify(`spawned ${id} (${title})`, "info");
+      return;
+    }
+    case "list": {
+      const list = ring.list().map((v) => `${v.id} ${v.status} ${v.title}`);
+      ctx.ui.notify(list.length > 0 ? list.join("\n") : "no subagents", "info");
+      return;
+    }
+    case "steer": {
+      const [id, ...msg] = restStr.split(/\s+/);
+      const ok = await hub.steer(id, msg.join(" "));
+      ctx.ui.notify(ok ? `steered ${id}` : `unknown child: ${id}`, ok ? "info" : "warning");
+      return;
+    }
+    case "kill": {
+      await hub.kill(rest[0]);
+      ctx.ui.notify(`killed ${rest[0]}`, "info");
+      return;
+    }
+    case "resume": {
+      const ok = await hub.resume(rest[0], "You are being resumed by the parent. State your situation.");
+      ctx.ui.notify(ok ? `resumed ${rest[0]}` : `cannot resume ${rest[0]} (no session file)`, ok ? "info" : "warning");
+      return;
+    }
+    case "inspect": {
+      const v = ring.get(rest[0]);
+      if (!v) {
+        ctx.ui.notify(`unknown child ${rest[0]}`, "warning");
+        return;
+      }
+      ctx.ui.notify(`${v.id}: ${v.status} session ${v.sessionFile ?? "?"}`, "info");
+      return;
+    }
+    default:
+      ctx.ui.notify("/subagent spawn|list|steer|kill|resume|inspect", "warning");
+      return;
   }
 }

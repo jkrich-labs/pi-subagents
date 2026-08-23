@@ -69,6 +69,21 @@ export class Hub {
   private readonly deliver: (d: Delivery) => void;
   private readonly kids = new Map<string, ChildState>();
 
+  /** Liveness engine hooks (S-08) */
+  onSpawn: ((id: string) => void) | null = null;
+  onExit: ((id: string, reason: string) => void) | null = null;
+  onTurn:
+    | ((id: string, rec: {
+        toolCallCount: number;
+        thinkingText: string;
+        reportText: string;
+        toolNames: string[];
+        toolArgsHash: string;
+        toolResultsHash: string;
+        assistantText: string;
+      }) => void)
+    | null = null;
+
   constructor(opts: { ground?: Ground; deliver: (d: Delivery) => void }) {
     this.ground = opts.ground ?? new Ground();
     this.deliver = opts.deliver;
@@ -100,6 +115,14 @@ export class Hub {
     };
     this.kids.set(id, state);
     child.setLineHandler((line) => this.onLine(id, line));
+    child.onExit = () => {
+      if (!this.kids.has(id)) return;
+      this.kids.delete(id);
+      ring.upsert(id, { status: "crashed" });
+      this.onExit?.(id, "crash");
+      this.deliver({ type: "crash", childId: id, reason: "process exited" });
+    };
+    this.onSpawn?.(id);
 
     ring.upsert(id, {
       id,
@@ -125,6 +148,33 @@ export class Hub {
       case "turn_end":
         st.turnCount += 1;
         ring.upsert(id, { turnCount: st.turnCount });
+        // Build a liveness turn record from the last turn_end message.
+        {
+          const msg = line.message as Record<string, unknown> | undefined;
+          const content = (msg?.content ?? []) as Array<Record<string, unknown>>;
+          const toolCalls = content.filter((c) => c.type === "toolCall").length;
+          const thinkingText = content
+            .filter((c) => c.type === "thinking")
+            .map((c) => String(c.thinking ?? ""))
+            .join("\n");
+          const reportText = content
+            .filter((c) => c.type === "text")
+            .map((c) => String(c.text ?? ""))
+            .join("\n");
+          const toolNames = content
+            .filter((c) => c.type === "toolCall")
+            .map((c) => String((c as { name?: string }).name ?? ""));
+          const results = (line.toolResults ?? []) as Array<Record<string, unknown>>;
+          this.onTurn?.(id, {
+            toolCallCount: toolCalls,
+            thinkingText,
+            reportText,
+            toolNames,
+            toolArgsHash: JSON.stringify(toolNames),
+            toolResultsHash: JSON.stringify(results),
+            assistantText: [thinkingText, reportText].join("\n"),
+          });
+        }
         break;
       case "compaction_end":
         st.compactions += 1;
@@ -202,6 +252,7 @@ export class Hub {
     } finally {
       this.kids.delete(id);
       ring.upsert(id, { status: "killed" });
+      this.onExit?.(id, "kill");
     }
   }
 
@@ -216,6 +267,68 @@ export class Hub {
 
   getView(id: string): ChildView | undefined {
     return ring.get(id);
+  }
+
+  getChild(id: string): RpcChild | undefined {
+    return this.kids.get(id)?.child;
+  }
+
+  /**
+   * Resume a killed/crashed child: re-spawn on its persisted session file
+   * and switch_session back, preserving context/cache.
+   */
+  async resume(id: string, prompt: string): Promise<boolean> {
+    const view = ring.get(id);
+    if (!view) return false;
+    const sessionFile = view.sessionFile;
+    if (!sessionFile) return false;
+
+    // Delete tombstones? The tombstone stays as a historical fact; the new
+    // incarnation is the resumed session.
+    const { model, provider, thinking } = resolveSpawn({});
+    const state = this.kids.get(id);
+    if (state?.child.isRunning()) {
+      // already live — do nothing
+      return true;
+    }
+
+    const child = await RpcChild.spawnChild({
+      sessionDir: this.ground.sessions,
+      sessionName: `subagent-${id}-resume`,
+      provider,
+      model,
+      thinking,
+      systemPrompt: CHILD_SYSTEM_PROMPT,
+    });
+    const sw = await child.send("switch_session", { sessionPath: sessionFile }, 10_000);
+    if (!sw.success) {
+      await child.shutdown();
+      throw new Error(`switch_session during resume failed: ${sw.error}`);
+    }
+    const st: ChildState = {
+      id,
+      title: view.title,
+      child,
+      model,
+      provider,
+      thinking,
+      sessionFile,
+      turnCount: view.turnCount,
+      compactions: view.compactions,
+      finalizedEnds: 0,
+    };
+    this.kids.set(id, st);
+    child.setLineHandler((line) => this.onLine(id, line));
+    child.onExit = () => {
+      if (!this.kids.has(id)) return;
+      this.kids.delete(id);
+      ring.upsert(id, { status: "crashed" });
+      this.onExit?.(id, "crash");
+      this.deliver({ type: "crash", childId: id, reason: "process exited" });
+    };
+    ring.upsert(id, { status: "working" });
+    if (prompt) void child.send("prompt", { message: prompt }, 10_000).catch(() => {});
+    return true;
   }
 
   /** Cursor poll slot (≤1s) — S-08 fills heartbeat; S-04 keeps it a no-op. */

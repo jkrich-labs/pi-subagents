@@ -29,6 +29,7 @@ export class RpcChild {
   private exited = false;
   exitCode: number | null = null;
   exitSignal: NodeJS.Signals | null = null;
+  onExit: (() => void) | null = null;
   private idSeq = 0;
   private onLine: ((line: WireLine) => void) | null = null;
 
@@ -47,6 +48,7 @@ export class RpcChild {
       const err = new Error(`child exited (code=${code}, signal=${signal}) stderr: ${tail}`);
       for (const [, { reject }] of this.pending) reject(err);
       this.pending.clear();
+      this.onExit?.();
     });
   }
 
