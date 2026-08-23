@@ -6,7 +6,8 @@
   "description": "Background subagent fleet for pi",
   "license": "MIT",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test tests/"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
