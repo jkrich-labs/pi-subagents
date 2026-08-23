@@ -8,7 +8,7 @@ wall-clock caps anywhere.
 
 - **[CONTEXT.md](CONTEXT.md)** — the vocabulary (parent/child/hub/ring and the naming invariants).
 - **[docs/spike-results.md](docs/spike-results.md)** — verified pi 0.84.2 facts (same-process extensions, public API surface, spawn flags).
-- **[docs/interop.md](docs/interop.md)** — provider interop (hyper / gateway / grok thinking + temperature maps).
+- **[docs/interop.md](docs/interop.md)** — provider interop (hyper / opencode-go / grok thinking + temperature maps).
 - **[docs/provider-maps.md](docs/provider-maps.md)** — `models/registry.json` format reference.
 
 ## Development

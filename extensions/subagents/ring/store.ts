@@ -1,0 +1,79 @@
+/**
+ * Ring store — the live, in-process state shared between the hub (writes)
+ * and UI widgets/overlays (read). Single object per pi process; paired by
+ * that process only. No companion HTTP server (A1 verified in S-02).
+ */
+import { EventEmitter } from "node:events";
+
+export type ChildStatus =
+  | "spawning"
+  | "working"
+  | "asking"
+  | "done"
+  | "crashed"
+  | "killed";
+
+export interface ChildView {
+  id: string;
+  title: string;
+  status: ChildStatus;
+  model?: string;
+  provider?: string;
+  thinking?: string;
+  spawnedAt: number;
+  turnCount: number;
+  compactions: number;
+  lastCompletionAt?: number;
+  ask?: string;
+  scopeCount: number;
+  sessionFile?: string;
+  stallCount: number;
+  loopHits: number;
+}
+
+export function blankView(): ChildView {
+  return {
+    id: "",
+    title: "",
+    status: "spawning",
+    spawnedAt: Date.now(),
+    turnCount: 0,
+    compactions: 0,
+    scopeCount: 0,
+    stallCount: 0,
+    loopHits: 0,
+  };
+}
+
+export class RingStore extends EventEmitter {
+  private children = new Map<string, ChildView>();
+
+  upsert(id: string, patch: Partial<ChildView>): ChildView {
+    const existing = this.children.get(id) ?? { ...blankView(), id };
+    const next: ChildView = { ...existing, ...patch, id };
+    this.children.set(id, next);
+    this.emit("update", id, next);
+    return next;
+  }
+
+  get(id: string): ChildView | undefined {
+    return this.children.get(id);
+  }
+
+  list(): ChildView[] {
+    return [...this.children.values()];
+  }
+
+  remove(id: string): void {
+    this.children.delete(id);
+    this.emit("remove", id);
+  }
+
+  /** Test seam — reset to empty. */
+  reset(): void {
+    this.children.clear();
+  }
+}
+
+/** Process-wide singleton: hub writes, UI reads. */
+export const ring = new RingStore();

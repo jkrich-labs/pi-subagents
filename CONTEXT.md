@@ -9,7 +9,7 @@ Terms used across planning/implementation/skills. Update as they crystallize.
 - **Hub** — the child manager: spawn, poll via `get_entries` cursor (≤1s), steering queue, finalize, events. Runs where the pi TUI process runs.
 - **Ring / data ring** — the live state shared between hub and UI widgets/overlays. Single in-process object (no companion HTTP server — confirmed by S-02 spike): hub writes, UI reads.
 - **Command routing** — a steer from parent → hub → child, preserving schema.
-- **Interop** — child uses the same model abstraction as the parent (hyper, gateway). No custom binary/middleware.
+- **Interop** — child uses the same model abstraction as the parent (hyper, opencode-go alias routes like provider directly). No custom binary/middleware.
 - **subagentGround** — the hub's ground directory for child session files, pidfiles, and tombstones.
 
 ## Naming invariants (never change)

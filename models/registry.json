@@ -1,0 +1,24 @@
+{
+  "$schema": "../docs/provider-maps.md",
+  "version": 1,
+  "models": [
+    {
+      "id": "gpt-5.6-luna",
+      "provider": "opencode-go",
+      "name": "GPT 5.6 Luna",
+      "thinkingLevelMap": {
+        "off": "low",
+        "minimal": "low",
+        "low": "low",
+        "medium": "low",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high"
+      },
+      "defaultOverrides": {
+        "temperature": 0.7,
+        "top_p": 1.0
+      }
+    }
+  ]
+}

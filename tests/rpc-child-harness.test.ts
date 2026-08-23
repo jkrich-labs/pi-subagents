@@ -1,6 +1,6 @@
 /**
  * S-03 protocol harness tests — hub↔child RPC boundary.
- * Real `pi --mode rpc` children on the pinned gpt-5.6-luna model.
+ * Real `pi --mode rpc` children on the pinned gpt-5.6-luna model (opencode-go).
  * Run: node --test tests/rpc-child-harness.test.ts
  */
 import { test } from "node:test";
@@ -15,8 +15,7 @@ import { TESTING_PROVIDER, TESTING_MODEL, TESTING_THINKING } from "../harness/te
  * One fresh child per test. Children must not use --no-session:
  * all sessions persist under subagentGround here = mkdtemp dir.
  */
-async function childWithDir(): Promise<{ child: RpcChild; dir: string }> {
-  const dir = mkdtempSync(join(tmpdir(), "subagentGround-"));
+async function childWithDir(): Promise<{ child: RpcChild; dir: string }> {  const dir = mkdtempSync(join(tmpdir(), "subagentGround-"));
   const child = await RpcChild.spawnAndWaitReady({
     sessionDir: dir,
     name: "rpc-child-harness",
@@ -342,20 +341,18 @@ test("switch_session resurrects the prior conversation (A16)", { timeout: 240_00
 test("set_thinking_level via RPC echoes/valid-clamps (A9/A10 lean)", { timeout: 180_000, concurrency: 1 }, async () => {
   const { child } = await childWithDir();
   try {
-    const off = await child.send("set_thinking_level", { level: "off" });
-    assert.ok(off.success, `set thinking off: ${off.error ?? ""}`);
-    const stateOff = await child.send("get_state", {});
-    assert.equal((stateOff.data as { thinkingLevel?: string }).thinkingLevel, "off");
+    const avail = await child.send("get_available_thinking_levels", {});
+    assert.ok(avail.success);
+    const levels = (avail.data as { levels?: string[] }).levels ?? [];
+    // gpt-5.6-luna measured fact: floor is "low" — off/minimal are not offered.
+    assert.deepEqual(levels, ["low", "medium", "high", "xhigh", "max"], `model level set: ${levels}`);
 
-    const max = await child.send("set_thinking_level", { level: "max" });
-    if (max.success) {
-      const stateMax = await child.send("get_state", {});
-      const level = (stateMax.data as { thinkingLevel?: string }).thinkingLevel;
-      assert.ok(level && ["minimal", "low", "medium", "high", "xhigh", "max"].includes(level), `valid thinking level: ${level}`);
-      console.log(`A9/A10 measured: max request yields ${level} on gpt-5.6-luna-fast`);
-    } else {
-      console.log(`A9/A10 measured: max unsupported on gpt-5.6-luna-fast: ${max.error}`);
-    }
+    const off = await child.send("set_thinking_level", { level: "off" });
+    assert.ok(off.success, `set thinking off accepted: ${off.error ?? ""}`);
+    const stateOff = await child.send("get_state", {});
+    const clamped = (stateOff.data as { thinkingLevel?: string }).thinkingLevel;
+    assert.ok(levels.includes(clamped ?? ""), `off clamps to a real level: ${clamped}`);
+    console.log(`A9/A10 measured: off clamps to ${clamped} on ${TESTING_MODEL}`);
   } finally {
     await child.shutdown();
   }

@@ -8,15 +8,15 @@ reads at spawn. The schema below is implemented by the registry loader
 
 ```json
 {
-  "$schema": "models/registry.schema.json",  // versioned copy of this contract
+  "$schema": "../docs/provider-maps.md",
   "version": 1,
   "models": [
     {
-      "id": "zai/glm-5.1",
-      "provider": "vercel-ai-gateway",
-      "name": "GLM 5.1",
+      "id": "gpt-5.6-luna",
+      "provider": "opencode-go",
+      "name": "GPT 5.6 Luna",
       "thinkingLevelMap": {
-        "off": null,
+        "off": "low",
         "minimal": "low",
         "low": "low",
         "medium": "low",
@@ -37,8 +37,8 @@ reads at spawn. The schema below is implemented by the registry loader
 
 - `registryEntry.id` — exact model id string, as accepted by
   `pi --model <id>`.
-- `.provider` — provider name the id lives under (hyper, vercel-ai-gateway,
-  …); must match a provider pi knows.
+- `.provider` — provider name the id lives under (hyper, opencode-go, …);
+  must match a provider pi knows.
 - `.name` — display name for the ticker/lens/UX.
 - `.thinkingLevelMap` — maps each pi level to the provider token for that
   level, or `null` when that level does not exist on the model. Keys are
@@ -58,9 +58,7 @@ reads at spawn. The schema below is implemented by the registry loader
 
 | id | provider | thinking token scheme |
 |---|---|---|
-| zai/glm-5.1 | vercel-ai-gateway | effort high\|low |
-| cursor/grok-4.6-fast | (register via cursor provider) | arity-dependent |
-| hyper/* | hyper | reasoning_level on/off |
+| gpt-5.6-luna | opencode-go | registry thinkingLevelMap |
 
 Provider-token facts belong here after S-03 verification; interop prose lives
 in `docs/interop.md`.

@@ -11,5 +11,19 @@
     "verbatimModuleSyntax": true,
     "types": []
   },
-  "files": ["spike.ts", "harness/rpc-child.ts", "harness/testing-models.ts", "tests/rpc-child-harness.test.ts"]
+  "files": [
+    "spike.ts",
+    "harness/rpc-child.ts",
+    "harness/testing-models.ts",
+    "tests/rpc-child-harness.test.ts",
+    "extensions/subagents/ground.ts",
+    "extensions/subagents/child.ts",
+    "extensions/subagents/ring/store.ts",
+    "extensions/subagents/route.ts",
+    "extensions/subagents/tokens.ts",
+    "extensions/subagents/lenses.ts",
+    "extensions/subagents/registry.ts",
+    "extensions/subagents/hub.ts",
+    "extensions/subagents/index.ts"
+  ]
 }
