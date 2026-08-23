@@ -636,6 +636,34 @@ test("parent bash guard blocks raw delegation, polling, and hub-owned kills", ()
   for (const command of ["bash -c 'pi --mode rpc'", "env pi --mode rpc", "sh -c 'exec pi --mode rpc'", "bash -c \"$(which pi) --mode rpc\"", "${PI_BIN:-pi} --mode rpc", "p$(printf i) --mode rpc", "$(printf '\\160\\151') --mode rpc", "$'\\x70\\x69' --mode rpc", "p$'\\u0069' --mode rpc", "$(printf p)$(printf i) --mode rpc", "printf '\\160\\151 --mode rpc' | sh", "P=pi;$P --mode rpc", "command \\pi --mode rpc"]) {
     assert.equal(parentBashGuard(command, false, () => false)?.block, true, `wrapped nested pi is blocked: ${command}`);
   }
+  // Regression: quoted heredoc bodies are inert data, not code. A git commit
+  // message that mentions pi/echo/sleep/kill must not trip the nested-pi guard.
+  const commitWithHeredoc = `cd /home/johnr/dev/repos/pi-autoresearch && git commit -m "$(cat <<'EOF'
+ Stream live configure progress through autoresearch_configure
+
+ The configure tool ignored its onUpdate callback, so calibration (one
+ evaluator dry-run plus one run per baseline sample, often minutes of
+ authenticated benchmark work) rendered as a silent spinner. Thread
+ structured progress events through RunConfigurator.configure and
+ Evaluator.calibrate, and bridge them into the tool's live partial
+ updates with a throttled reporter and custom renderCall/renderResult.
+
+ The tool row now shows each stage as it happens: repository
+ verification, evaluator dry-run, probe/guard dry-runs, and every
+ baseline sample, ending with a confirmed \"Run configured\".
+ EOF
+)" && git log --oneline -3`;
+  assert.equal(parentBashGuard(commitWithHeredoc, false, () => false), undefined, "heredoc commit message is not a nested pi launch");
+  assert.equal(
+    parentBashGuard("git commit -m \"$(cat <<-'EOF'\n\tpi --mode rpc\n\tEOF\n)\"", false, () => false),
+    undefined,
+    "tab-stripped heredoc body mentioning pi stays inert",
+  );
+  assert.equal(parentBashGuard("echo $(date)", false, () => false), undefined, "benign command substitution is not a wrapper");
+  assert.equal(parentBashGuard("echo \"cat <<'EOF'\"", false, () => false), undefined, "a literal heredoc marker in a string is not a heredoc");
+  // Command substitution that invokes a launcher is still a wrapper.
+  assert.equal(parentBashGuard("$(echo pi) --mode rpc", false, () => false)?.block, true, "substitution invoking a launcher stays blocked");
+  assert.equal(parentBashGuard("$(bash -c 'pi --mode rpc')", false, () => false)?.block, true, "substitution invoking bash stays blocked");
 });
 
 test("fleet overlay stays active through a selected child inspection", async () => {

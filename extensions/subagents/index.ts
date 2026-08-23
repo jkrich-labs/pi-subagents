@@ -58,9 +58,20 @@ function killTargets(command: string): number[] {
   return targets;
 }
 
+/**
+ * Strip quoted heredoc bodies (<<'EOF' … EOF / <<-"EOF" … EOF) before
+ * analysis. Their contents are inert data — no shell expansion happens — so
+ * prose inside them (e.g. a git commit message that mentions `pi`, `echo`,
+ * `sleep`, or `kill`) must not be read as commands. Unquoted heredocs stay in
+ * scope: their bodies can expand `$PI` etc., so they are analyzed as-is.
+ */
+function stripQuotedHeredocs(command: string): string {
+  return command.replace(/<<-?\s*(["'])([A-Za-z0-9_]+)\1[^\n]*\n[^]*?\n[ \t]*\2[ \t]*(?=\n|$)/g, "");
+}
+
 function launchesNestedPi(command: string): boolean {
-  const raw = command;
-  const normalized = command.replace(/["']/g, " ");
+  const raw = stripQuotedHeredocs(command);
+  const normalized = raw.replace(/["']/g, " ");
   const direct = /(?:^|[;&|()\n]\s*)(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|command|exec|nohup|env)\s+)*(?:\S*\/)?pi(?:\s+|$)(.*)$/is.exec(normalized);
   if (direct) {
     return !/^(?:--help|-h|--version|-v|--list-models)(?:\s|$)/.test(direct[1].trim());
@@ -68,7 +79,10 @@ function launchesNestedPi(command: string): boolean {
   // Shell wrappers (`bash -c`, `env`, `sh -c 'exec pi …'`) hide the
   // executable from the direct-command expression above. Treat any wrapped
   // pi invocation as nested delegation rather than letting it escape policy.
-  return /\$\(/.test(raw) ||
+  // Command substitution alone is not suspicious — `$(cat <<'EOF' … EOF)` in
+  // a commit message is data, not a wrapper. Only flag substitutions that
+  // invoke a launcher (pi, bash, sh, env, exec, nohup).
+  return /\$\([^)]*\b(?:pi|bash|sh|env|exec|nohup)\b/i.test(raw) ||
     /\b[A-Za-z_]\w*\$[A-Za-z_]\w*/.test(raw) ||
     /(?:^|[;&|])[^\n;|]*\b[A-Za-z_]\w*=\S+\s*;[^\n;|]*\$[A-Za-z_]/.test(raw) ||
     /(?:^|[\s;&|()])(?:\S*\/)?pi(?=\s|$)/i.test(normalized) ||
