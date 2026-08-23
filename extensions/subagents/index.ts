@@ -15,6 +15,105 @@ import { type SessionEntryLike } from "./ui/inspect.ts";
 import { openInspectOverlay, openNavigateOverlay } from "./ui/overlay.ts";
 import { attachFleetEditorNavigation, FleetWidget, supportsFleetEditorNavigation } from "./ui/focus.ts";
 import { readFileSync } from "node:fs";
+import { agentRegistry } from "./agents.ts";
+
+const POLLING_BLOCK_REASON =
+  "A subagent is still working in the background. Do not poll with shell sleeps; end this turn instead.";
+const CHILD_KILL_BLOCK_REASON =
+  "Child processes are owned by the subagent hub. Do not shell-kill them or spawn duplicate retries; end this turn instead.";
+const RAW_PI_BLOCK_REASON =
+  "Do not launch nested pi agents through bash or manage their PID files. Use Task/spawn_subagent with cwd instead.";
+const RAW_POLLING_BLOCK_REASON =
+  "Do not poll background work with shell sleeps or PID checks. Delegate through Task/spawn_subagent and end this turn.";
+
+export interface ParentBashGuardDecision {
+  block: true;
+  reason: string;
+  terminate: true;
+}
+
+export interface SpawnToolResult {
+  content: Array<{ type: "text"; text: string }>;
+  details: { childId?: string; agent?: string };
+  terminate?: boolean;
+}
+
+function isPollingSleep(command: string): boolean {
+  const match = /^\s*sleep\s+\d+(?:\.\d+)?(?:[smhd])?\s*(.*)$/is.exec(command);
+  if (!match) return false;
+  const remainder = match[1].replace(/^\s*(?:;|&&)\s*/, "").trim();
+  if (!remainder) return true;
+  return /^(?:echo\s+(?:wait|waiting|done)\b|ps\b|pgrep\b|jobs\b)/i.test(remainder);
+}
+
+function killTargets(command: string): number[] {
+  const targets: number[] = [];
+  for (const match of command.matchAll(/(?:^|[;&|]\s*)kill\s+([^;&|\n]+)/g)) {
+    for (const token of match[1].trim().split(/\s+/)) {
+      if (/^\d+$/.test(token)) targets.push(Number(token));
+    }
+  }
+  return targets;
+}
+
+function launchesNestedPi(command: string): boolean {
+  return command.split(/[;&|()\n]+/).some((part) => {
+    const invocation = /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|command|exec|nohup)\s+)*(?:\S*\/)?pi(?:\s+|$)(.*)$/is.exec(part);
+    if (!invocation) return false;
+    const args = invocation[1].trim();
+    return !/^(?:--help|-h|--version|-v|--list-models)(?:\s|$)/.test(args);
+  });
+}
+
+export function parentBashGuard(
+  command: string,
+  hasActiveChildren: boolean,
+  ownsProcess: (pid: number) => boolean,
+): ParentBashGuardDecision | undefined {
+  if (launchesNestedPi(command)) {
+    return { block: true, reason: RAW_PI_BLOCK_REASON, terminate: true };
+  }
+  if (killTargets(command).some(ownsProcess)) {
+    return { block: true, reason: CHILD_KILL_BLOCK_REASON, terminate: true };
+  }
+  if (isPollingSleep(command)) {
+    return {
+      block: true,
+      reason: hasActiveChildren ? POLLING_BLOCK_REASON : RAW_POLLING_BLOCK_REASON,
+      terminate: true,
+    };
+  }
+  return undefined;
+}
+
+export function mapTaskRequest(params: { subagent_type: string; prompt: string; description?: string; cwd?: string }): SpawnRequest {
+  const request: SpawnRequest = {
+    agent: params.subagent_type.trim(),
+    prompt: params.prompt.trim(),
+  };
+  const title = params.description?.trim();
+  if (title) request.title = title;
+  const cwd = params.cwd?.trim();
+  if (cwd) request.cwd = cwd;
+  return request;
+}
+
+export function spawnSuccessText(id: string, label: string): string {
+  return [
+    `Subagent spawned: ${id} (${label}).`,
+    `Steer with steer_subagent(child_id=${JSON.stringify(id)}, message=...).`,
+    "If no genuinely independent work remains, end your turn immediately.",
+    "Never poll, sleep, inspect child processes, or manufacture busywork while waiting.",
+  ].join(" ");
+}
+
+export function spawnToolResult(id: string, label: string, agent?: string): SpawnToolResult {
+  return {
+    content: [{ type: "text", text: spawnSuccessText(id, label) }],
+    details: { childId: id, agent },
+    terminate: true,
+  };
+}
 
 function extractText(msg: Record<string, unknown>): string {
   const content = msg.content as Array<Record<string, unknown>> | undefined;
@@ -51,64 +150,164 @@ export default function (pi: ExtensionAPI) {
     await hub.shutdownAll();
   });
 
-  // Spawn tool — the parent LLM calls this to delegate background work.
+  const spawn = async (request: SpawnRequest, toolName: string): Promise<SpawnToolResult> => {
+    try {
+      const id = await hub.spawn(request);
+      const view = hub.getView(id);
+      const label = request.title?.trim() || view?.agent || "subagent";
+      return spawnToolResult(id, label, view?.agent);
+    } catch (error) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `${toolName} failed: ${error instanceof Error ? error.message : String(error)}`,
+        }],
+        details: {},
+      };
+    }
+  };
+
+  // Native pi delegation tool. Named engineering agents use their pinned
+  // presets; calls without an agent use the general-purpose preset.
   pi.registerTool({
     name: "spawn_subagent",
     label: "Spawn Subagent",
     description:
-      "Spawn a background subagent (pi child process) to work on a task in parallel. " +
-      "It reports back with DONE-PARENT when finished. Steer it later with @subagent-id <message>.",
+      "Spawn a background pi subagent. Select a named agent for engineering roles so its pinned " +
+      "provider, model, thinking level, tools, and role prompt are used. Generic calls use general-purpose. Completion is delivered automatically.",
+    promptSnippet: "Spawn a named or generic background subagent; completion is delivered automatically",
+    promptGuidelines: [
+      "When an engineering skill names a bundled agent, pass that name in spawn_subagent.agent instead of inventing model settings.",
+      "After spawn_subagent succeeds, do not poll or sleep; end your turn immediately unless genuinely independent useful work remains.",
+      "Never launch pi through bash, write child PID files, inspect child processes, or shell-kill children; the subagent hub owns their lifecycle.",
+      "Use cwd when a child must work in a specific worktree or directory.",
+    ],
     parameters: Type.Object({
-      title: Type.String({ description: "Short title for the child workstream" }),
+      agent: Type.Optional(Type.String({
+        description: `Bundled agent preset: ${agentRegistry.names().join(", ")}`,
+      })),
+      title: Type.Optional(Type.String({ description: "Short workstream title; required only for generic spawns" })),
       prompt: Type.String({ description: "Complete, self-contained instructions for the child" }),
-      model: Type.Optional(Type.String({ description: "Model id; defaults to the registry/testing model" })),
-      provider: Type.Optional(Type.String({ description: "Provider name; defaults to the model's registry provider" })),
-      thinking: Type.Optional(Type.String({ description: "Thinking level (off/minimal/low/medium/high/xhigh/max)" })),
+      model: Type.Optional(Type.String({ description: "Explicit model override" })),
+      provider: Type.Optional(Type.String({ description: "Explicit provider override" })),
+      thinking: Type.Optional(Type.String({ description: "Explicit thinking override: off/minimal/low/medium/high/xhigh/max" })),
+      cwd: Type.Optional(Type.String({ description: "Worktree or directory in which the child process starts" })),
     }),
-    async execute(toolCallId, params, _signal, _onUpdate, _ctx) {
-      void toolCallId;
-      if (typeof params.title !== "string" || params.title.trim().length === 0) {
-        return {
-          content: [{ type: "text", text: "spawn_subagent requires a non-empty title" }],
-          details: {},
-        };
-      }
-      if (typeof params.prompt !== "string" || params.prompt.trim().length === 0) {
-        return {
-          content: [{ type: "text", text: "spawn_subagent requires a non-empty prompt" }],
-          details: {},
-        };
-      }
-      const spawnReq: SpawnRequest = {
-        title: params.title.trim(),
-        prompt: params.prompt.trim(),
-        model: typeof params.model === "string" ? params.model : undefined,
-        provider: typeof params.provider === "string" ? params.provider : undefined,
-        thinking: typeof params.thinking === "string" ? params.thinking : undefined,
+    async execute(_toolCallId, params) {
+      const request: SpawnRequest = {
+        agent: typeof params.agent === "string" ? params.agent.trim() : undefined,
+        title: typeof params.title === "string" ? params.title.trim() : undefined,
+        prompt: typeof params.prompt === "string" ? params.prompt.trim() : "",
+        model: typeof params.model === "string" ? params.model.trim() : undefined,
+        provider: typeof params.provider === "string" ? params.provider.trim() : undefined,
+        thinking: typeof params.thinking === "string" ? params.thinking.trim() : undefined,
+        cwd: typeof params.cwd === "string" ? params.cwd.trim() : undefined,
       };
-      try {
-        const id = await hub.spawn(spawnReq);
+      if (!request.prompt) {
+        return { content: [{ type: "text", text: "spawn_subagent requires a non-empty prompt" }], details: {} };
+      }
+      if (!request.agent && !request.title) {
+        return { content: [{ type: "text", text: "A generic spawn_subagent call requires a non-empty title" }], details: {} };
+      }
+      return spawn(request, "spawn_subagent");
+    },
+  });
+
+  // Keep the Cursor-shaped Task affordance narrow and route it through the
+  // same named-agent resolver.
+  pi.registerTool({
+    name: "Task",
+    label: "Task",
+    description:
+      "Launch a bundled subagent by type in the background. Cursor-compatible delegation alias; completion is delivered automatically.",
+    promptSnippet: "Delegate work to a named bundled subagent",
+    promptGuidelines: [
+      "Use Task with subagent_type and prompt for Cursor-shaped delegation.",
+      "Pass cwd when the child must work in a specific worktree or directory.",
+      "After Task succeeds, do not call shell sleeps or poll; end your turn unless independent useful work remains.",
+    ],
+    parameters: Type.Object({
+      subagent_type: Type.String({ description: `Named agent: ${agentRegistry.names().join(", ")}` }),
+      prompt: Type.String({ description: "Complete, self-contained task for the subagent" }),
+      description: Type.Optional(Type.String({ description: "Short workstream title" })),
+      cwd: Type.Optional(Type.String({ description: "Worktree or directory in which the child process starts" })),
+    }),
+    async execute(_toolCallId, params) {
+      return spawn(mapTaskRequest(params), "Task");
+    },
+  });
+
+  pi.registerTool({
+    name: "steer_subagent",
+    label: "Steer Subagent",
+    description: "Send follow-up guidance to one live subagent without exposing control text in assistant output.",
+    promptSnippet: "Steer a live subagent through the hub",
+    promptGuidelines: [
+      "Use steer_subagent for child guidance; never emit @child-id control lines as assistant output.",
+      "If the tool reports that a child failed, do not keep steering or blindly spawn retries.",
+    ],
+    parameters: Type.Object({
+      child_id: Type.String({ description: "Exact child id from spawn_subagent/Task" }),
+      message: Type.String({ description: "Follow-up guidance for the child" }),
+    }),
+    async execute(_toolCallId, params) {
+      const childId = typeof params.child_id === "string" ? params.child_id.trim() : "";
+      const message = typeof params.message === "string" ? params.message.trim() : "";
+      if (!childId || !message) {
         return {
-          content: [
-            {
-              type: "text",
-              text: `Subagent spawned: ${id} (${params.title}). Steer with @${id} <message>.`,
-            },
-          ],
-          details: { childId: id },
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `spawn_subagent failed: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          details: {},
+          content: [{ type: "text" as const, text: "steer_subagent requires child_id and message" }],
+          details: { childId },
         };
       }
+      const view = hub.getView(childId);
+      if (!view || view.status === "failed" || view.status === "crashed" || view.status === "killed" || view.status === "done") {
+        const status = view?.status ?? "unknown";
+        const reason = view?.error ? `: ${view.error}` : "";
+        return {
+          content: [{ type: "text" as const, text: `steer_subagent failed: ${childId} is ${status}${reason}` }],
+          details: { childId },
+        };
+      }
+      const sent = await hub.steer(childId, message);
+      return {
+        content: [{
+          type: "text" as const,
+          text: sent ? `Guidance sent to ${childId}.` : `steer_subagent failed: ${childId} is not live`,
+        }],
+        details: { childId },
+      };
     },
+  });
+
+  // Cursor's AwaitShell schema is not public or stable. This permissive shim
+  // preserves the learned control-flow affordance without introducing polling.
+  pi.registerTool({
+    name: "AwaitShell",
+    label: "Await Shell",
+    description: "Yield after launching background tasks. Does not poll or wait; completion is delivered automatically.",
+    parameters: Type.Object({
+      task_id: Type.Optional(Type.String()),
+      shell_id: Type.Optional(Type.String()),
+    }),
+    async execute() {
+      return {
+        content: [{
+          type: "text" as const,
+          text: "Background tasks report completion automatically. End this turn now; do not poll or sleep.",
+        }],
+        details: {},
+        terminate: true,
+      };
+    },
+  });
+
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "bash") return;
+    const command = (event.input as { command?: unknown }).command;
+    if (typeof command !== "string") return;
+    const active = ring.list().some((child) =>
+      child.status === "spawning" || child.status === "working" || child.status === "asking");
+    return parentBashGuard(command, active, (pid) => hub.ownsProcess(pid));
   });
 
   // User → child routing. `@user <text>` strips the prefix and continues as a
@@ -216,7 +415,7 @@ export default function (pi: ExtensionAPI) {
 
   // `/subagent` user command.
   pi.registerCommand("subagent", {
-    description: "Manage the subagent fleet: spawn|list|steer|kill|resume|inspect|navigate",
+    description: "Manage subagents: agents|spawn|spawn-agent|list|steer|kill|resume|inspect|navigate",
     handler: async (args, ctx) => {
       await subagentCommand(pi, hub, ctx, args);
     },
@@ -244,7 +443,7 @@ function loadEntriesFromFile(sessionFile: string | undefined): SessionEntryLike[
   }
 }
 
-function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
+export function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
   switch (d.type) {
     case "lens":
       pi.appendEntry("subagent_lens", d.lens);
@@ -257,19 +456,49 @@ function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
         pi.appendEntry("subagent_done", { childId: d.childId, at: Date.now() });
       }
       break;
-    case "crash":
+    case "crash": {
       pi.appendEntry("subagent_crash", { childId: d.childId, reason: d.reason, at: Date.now() });
+      const retryGuidance = d.reason === "model is not supported by provider"
+        ? " Do not retry this provider/model selection; use a supported named preset."
+        : " Inspect the failure before deciding whether to resume or replace it.";
+      pi.sendUserMessage(
+        `[subagent ${d.childId}] FAILED: ${d.reason}.${retryGuidance}`,
+        { deliverAs: "followUp" },
+      );
       break;
+    }
   }
 }
 
 /**
  * `/subagent <cmd> <args…>` — spawn|list|steer|kill|resume|inspect.
  */
-async function subagentCommand(pi: ExtensionAPI, hub: Hub, ctx: ExtensionCommandContext, args: string): Promise<void> {
+export async function subagentCommand(pi: ExtensionAPI, hub: Hub, ctx: ExtensionCommandContext, args: string): Promise<void> {
   const [cmd, ...rest] = args.trim().split(/\s+/).filter(Boolean);
   const restStr = rest.join(" ");
   switch (cmd) {
+    case "agents": {
+      const list = agentRegistry.list().map(
+        (agent) => `${agent.name} ${agent.provider}/${agent.model} ${agent.thinking}`,
+      );
+      ctx.ui.notify(list.join("\n"), "info");
+      return;
+    }
+    case "spawn-agent": {
+      const agent = rest[0];
+      const prompt = rest.slice(1).join(" ");
+      if (!agent || !prompt) {
+        ctx.ui.notify("/subagent spawn-agent <agent> <prompt>", "warning");
+        return;
+      }
+      try {
+        const id = await hub.spawn({ agent, prompt });
+        ctx.ui.notify(`spawned ${id} (${agent})`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+      }
+      return;
+    }
     case "spawn": {
       const title = rest[0] ?? "untitled";
       const prompt = rest.slice(1).join(" ");

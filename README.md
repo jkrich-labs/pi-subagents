@@ -8,7 +8,7 @@ wall-clock caps anywhere.
 
 - **[CONTEXT.md](CONTEXT.md)** — the vocabulary (parent/child/hub/ring and the naming invariants).
 - **[docs/spike-results.md](docs/spike-results.md)** — verified pi 0.84.2 facts (same-process extensions, public API surface, spawn flags).
-- **[docs/interop.md](docs/interop.md)** — provider interop (hyper / opencode-go / grok thinking + temperature maps).
+- **[docs/interop.md](docs/interop.md)** — provider interop (hyper / openai-codex thinking and temperature maps).
 - **[docs/provider-maps.md](docs/provider-maps.md)** — `models/registry.json` format reference.
 
 ## Quickstart
@@ -18,7 +18,7 @@ Prerequisites:
 - **pi 0.84.2** on `PATH` (`npm install -g @earendil-works/pi-coding-agent@0.84.2`)
 - **Node 24+** (tests run on `node --test` with native TypeScript stripping)
 - Provider auth for the child model, same as an interactive pi run
-  (tests and the registry default pin `gpt-5.6-luna` via `opencode-go`)
+  (tests and the registry default pin `gpt-5.6-luna` via `openai-codex`)
 
 Then:
 
@@ -38,10 +38,25 @@ ln -s "$PWD/extensions/subagents" ~/.pi/agent/extensions/subagents
 
 ## Use
 
-- The parent agent calls the `spawn_subagent` tool, or you run
-  `/subagent spawn <title> <prompt>`.
-- Steer from the parent with `@<child-id> <message>` (`@all` broadcasts,
-  `@user` strips back to a normal parent message).
+- The parent calls `spawn_subagent` with a named `agent`, or uses the Cursor-compatible `Task` alias. Calls without `agent` remain supported and use the `general-purpose` preset.
+- List presets with `/subagent agents`. Start one manually with `/subagent spawn-agent <agent> <prompt>`; use `/subagent spawn <title> <prompt>` for a generic child.
+- Named presets keep these defaults unless the caller explicitly overrides them. OpenAI-family models always use the subscription-backed `openai-codex` provider:
+
+  | Agent | Provider/model | Thinking |
+  |---|---|---|
+  | `explorer` | `openai-codex/gpt-5.6-luna` | `medium` |
+  | `planner` | `kimi-coding/k3` | `max` |
+  | `mechanical-worker` | `openai-codex/gpt-5.6-luna` | `xhigh` |
+  | `general-purpose` | `openai-codex/gpt-5.6-terra` | `xhigh` |
+  | `senior` | `openai-codex/gpt-5.6-sol` | `xhigh` |
+  | `visual-designer` | `hyper/qwen3.8-max` | `high` |
+  | `reviewer-standards` | `openai-codex/gpt-5.6-terra` | `xhigh` |
+  | `reviewer-spec` | `openai-codex/gpt-5.6-terra` | `xhigh` |
+
+- Pass `cwd` to `spawn_subagent` or `Task` when a child must work in an isolated worktree.
+- After spawning, continue only genuinely independent work. Otherwise, end your turn immediately. Never launch `pi` through bash, create PID/exit files, poll, sleep, inspect child processes, or manufacture busywork while waiting.
+- Parent models steer with `steer_subagent`; this keeps control messages out of assistant output and reports a failed child immediately. Humans may still type `@<child-id> <message>` (`@all` broadcasts, `@user` returns to the parent).
+- Child failures are delivered as model-visible follow-up messages. An unsupported provider/model pair trips a session-local circuit breaker so retries cannot create a fleet of identical failures.
 - Children have pi's normal built-in tools enabled; unrelated extensions and
   skills remain disabled for isolation.
 - The focusable **fleet ticker** below the editor shows each child: status,

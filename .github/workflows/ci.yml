@@ -26,7 +26,7 @@ jobs:
       - run: node --test tests/ui.test.ts
 
       # Model-backed suites (hub / liveness / rpc-child-harness) spawn real
-      # `pi --mode rpc` children against opencode-go/gpt-5.6-luna and need
+      # `pi --mode rpc` children against openai-codex/gpt-5.6-luna and need
       # provider auth. Gated on the MODEL_TESTS repo variable so forks and
       # doc-only PRs stay green; enable it once the runner has credentials.
       - name: model-backed suites

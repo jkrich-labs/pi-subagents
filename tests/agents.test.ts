@@ -9,15 +9,16 @@ import {
   bundledAgentsPath,
   loadAgentDefinitions,
 } from "../extensions/subagents/agents.ts";
+import { buildChildArgs } from "../extensions/subagents/child.ts";
 
 const EXPECTED = {
   explorer: ["openai-codex", "gpt-5.6-luna", "medium"],
   planner: ["kimi-coding", "k3", "max"],
   "mechanical-worker": ["openai-codex", "gpt-5.6-luna", "xhigh"],
-  "general-purpose": ["cursor", "cursor-grok-4.6-fast", "high"],
+  "general-purpose": ["openai-codex", "gpt-5.6-terra", "xhigh"],
   senior: ["openai-codex", "gpt-5.6-sol", "xhigh"],
   "visual-designer": ["hyper", "qwen3.8-max", "high"],
-  "reviewer-standards": ["cursor", "cursor-grok-4.6-fast", "high"],
+  "reviewer-standards": ["openai-codex", "gpt-5.6-terra", "xhigh"],
   "reviewer-spec": ["openai-codex", "gpt-5.6-terra", "xhigh"],
 } as const;
 
@@ -77,6 +78,24 @@ test("agent registry rejects unknown names with the available inventory", () => 
   );
 });
 
+test("child argument construction leaves normal built-in tools enabled", () => {
+  const generic = buildChildArgs({ sessionDir: "/sessions" });
+  assert.ok(!generic.includes("--no-tools"), "generic children preserve their current normal tool set");
+
+  const named = buildChildArgs({
+    sessionDir: "/sessions",
+    provider: "openai-codex",
+    model: "gpt-5.6-luna",
+    thinking: "medium",
+    systemPrompt: "protocol and role",
+  });
+  assert.ok(!named.includes("--no-tools"), "named children receive normal built-in tools");
+  assert.deepEqual(named.slice(named.indexOf("--provider"), named.indexOf("--provider") + 6), [
+    "--provider", "openai-codex", "--model", "gpt-5.6-luna", "--thinking", "medium",
+  ]);
+  assert.equal(named[named.indexOf("--append-system-prompt") + 1], "protocol and role");
+});
+
 test("explicit named-agent dispatch overrides win independently", () => {
   const registry = new AgentRegistry(loadAgentDefinitions(bundledAgentsPath()));
   assert.deepEqual(
@@ -88,10 +107,23 @@ test("explicit named-agent dispatch overrides win independently", () => {
   );
   assert.deepEqual(
     registry.resolve("explorer", { provider: "override-provider" }),
+    registry.resolve("explorer"),
+    "OpenAI-family models always use the subscription-backed openai-codex provider",
+  );
+  assert.equal(registry.resolve("planner", { provider: "override-provider" }).provider, "override-provider");
+  assert.equal(
+    registry.resolve("planner", { model: "gpt-5.6-terra", provider: "hyper" }).provider,
+    "openai-codex",
+  );
+  assert.deepEqual(
+    registry.resolve("planner", { model: "cursor-grok-4.6-fast", provider: "cursor", thinking: "high" }),
     {
-      ...registry.resolve("explorer"),
-      provider: "override-provider",
+      ...registry.resolve("planner"),
+      model: "gpt-5.6-terra",
+      provider: "openai-codex",
+      thinking: "xhigh",
     },
+    "retired Grok 4.6 overrides migrate to Terra xhigh",
   );
   assert.deepEqual(
     registry.resolve("explorer", { thinking: "xhigh" }),

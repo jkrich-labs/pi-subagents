@@ -11,13 +11,17 @@ import { ring, type ChildView } from "./ring/store.ts";
 import { reportFrom as tokenReport } from "./tokens.ts";
 import { makeAskLens, makeCompletionLens, type Lens } from "./lenses.ts";
 import { resolveSpawn } from "./registry.ts";
+import { agentRegistry, type AgentToolPolicy } from "./agents.ts";
 
 export interface SpawnRequest {
-  title: string;
+  title?: string;
   prompt: string;
+  agent?: string;
   model?: string;
   provider?: string;
   thinking?: string;
+  /** Optional worktree/directory in which the child process starts. */
+  cwd?: string;
 }
 
 export type Delivery =
@@ -30,9 +34,13 @@ interface ChildState {
   id: string;
   title: string;
   child: RpcChildHandle;
-  model?: string;
-  provider?: string;
-  thinking?: string;
+  agent?: string;
+  cwd?: string;
+  model: string;
+  provider: string;
+  thinking: string;
+  systemPrompt: string;
+  toolPolicy: AgentToolPolicy;
   sessionFile?: string;
   turnCount: number;
   compactions: number;
@@ -91,11 +99,61 @@ function stripControlTokens(text: string): string {
     .join("\n");
 }
 
+interface ResolvedLaunch {
+  title: string;
+  agent?: string;
+  cwd?: string;
+  model: string;
+  provider: string;
+  thinking: string;
+  systemPrompt: string;
+  toolPolicy: AgentToolPolicy;
+}
+
+function resolveLaunch(req: SpawnRequest): ResolvedLaunch {
+  if (req.agent?.trim()) {
+    const named = agentRegistry.resolve(req.agent, req);
+    return {
+      title: req.title?.trim() || named.name,
+      agent: named.name,
+      cwd: req.cwd,
+      model: named.model,
+      provider: named.provider,
+      thinking: named.thinking,
+      systemPrompt: named.systemPrompt,
+      toolPolicy: named.toolPolicy,
+    };
+  }
+
+  const title = req.title?.trim();
+  if (!title) throw new Error("generic subagent spawn requires a non-empty title");
+  const general = agentRegistry.resolve("general-purpose", req);
+  return {
+    title,
+    agent: general.name,
+    cwd: req.cwd,
+    model: general.model,
+    provider: general.provider,
+    thinking: general.thinking,
+    systemPrompt: general.systemPrompt,
+    toolPolicy: general.toolPolicy,
+  };
+}
+
+function titleKey(title: string): string {
+  return title.toLowerCase().replace(/\s+retry(?:\s+\d+)?\s*$/i, "").replace(/\s+/g, " ").trim();
+}
+
+function launchKey(provider: string, model: string): string {
+  return `${provider}\u0000${model}`;
+}
+
 export class Hub {
   readonly ground: Ground;
   private readonly deliver: (d: Delivery) => void;
   private readonly spawnChild: (options: RpcChildOptions) => Promise<RpcChildHandle>;
   private readonly kids = new Map<string, ChildState>();
+  private readonly unsupportedSelections = new Set<string>();
   private generation = 0;
 
   /** Liveness engine hooks (S-08) */
@@ -145,25 +203,44 @@ export class Hub {
 
   async spawn(req: SpawnRequest): Promise<string> {
     const generation = this.generation;
-    const { model, provider, thinking } = resolveSpawn(req);
+    const prompt = req.prompt.trim();
+    if (!prompt) throw new Error("subagent spawn requires a non-empty prompt");
+    const launch = resolveLaunch({ ...req, prompt });
+    if (this.unsupportedSelections.has(launchKey(launch.provider, launch.model))) {
+      throw new Error(
+        `subagent launch blocked: ${launch.provider}/${launch.model} already failed as unsupported; choose a supported preset instead of retrying`,
+      );
+    }
+    const duplicate = [...this.kids.values()].find(
+      (state) => state.child.isRunning() && titleKey(state.title) === titleKey(launch.title),
+    );
+    if (duplicate) {
+      throw new Error(`subagent already working: ${duplicate.id} (${duplicate.title})`);
+    }
+
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const child = await this.spawnChild({
       sessionDir: this.ground.sessions,
       sessionName: `subagent-${id}`,
-      provider,
-      model,
-      thinking,
-      systemPrompt: CHILD_SYSTEM_PROMPT,
+      cwd: launch.cwd,
+      provider: launch.provider,
+      model: launch.model,
+      thinking: launch.thinking,
+      systemPrompt: launch.systemPrompt,
     });
     await this.rejectReplacedSessionChild(generation, child, "spawn");
 
     const state: ChildState = {
       id,
-      title: req.title,
+      title: launch.title,
       child,
-      model,
-      provider,
-      thinking,
+      agent: launch.agent,
+      cwd: launch.cwd,
+      model: launch.model,
+      provider: launch.provider,
+      thinking: launch.thinking,
+      systemPrompt: launch.systemPrompt,
+      toolPolicy: launch.toolPolicy,
       sessionFile: child.sessionFile,
       turnCount: 0,
       compactions: 0,
@@ -186,16 +263,20 @@ export class Hub {
 
     ring.upsert(id, {
       id,
-      title: req.title,
+      title: launch.title,
       status: "working",
-      model,
-      provider,
-      thinking,
+      agent: launch.agent,
+      cwd: launch.cwd,
+      model: launch.model,
+      provider: launch.provider,
+      thinking: launch.thinking,
+      systemPrompt: launch.systemPrompt,
+      toolPolicy: launch.toolPolicy,
       spawnedAt: Date.now(),
       sessionFile: state.sessionFile,
     });
 
-    void child.send("prompt", { message: req.prompt }, 10_000).catch(() => {
+    void child.send("prompt", { message: prompt }, 10_000).catch(() => {
       /* crash path handles a dead child */
     });
     return id;
@@ -270,6 +351,9 @@ export class Hub {
     st.pendingTurnMessage = undefined;
     if (failure) {
       const reason = failure;
+      if (reason === "model is not supported by provider") {
+        this.unsupportedSelections.add(launchKey(st.provider, st.model));
+      }
       ring.upsert(st.id, {
         status: "failed",
         error: reason,
@@ -359,6 +443,10 @@ export class Hub {
     return this.kids.get(id)?.child;
   }
 
+  ownsProcess(pid: number): boolean {
+    return [...this.kids.values()].some((state) => state.child.isRunning() && state.child.proc.pid === pid);
+  }
+
   /**
    * Resume a killed/crashed child: re-spawn on its persisted session file
    * and switch_session back, preserving context/cache.
@@ -371,7 +459,14 @@ export class Hub {
 
     // Delete tombstones? The tombstone stays as a historical fact; the new
     // incarnation is the resumed session.
-    const { model, provider, thinking } = resolveSpawn({});
+    const selection = resolveSpawn({
+      model: view.model,
+      provider: view.provider,
+      thinking: view.thinking,
+    });
+    const { model, provider, thinking } = selection;
+    const systemPrompt = view.systemPrompt ?? CHILD_SYSTEM_PROMPT;
+    const toolPolicy = view.toolPolicy ?? "normal";
     const state = this.kids.get(id);
     if (state?.child.isRunning()) {
       // already live — do nothing
@@ -382,10 +477,11 @@ export class Hub {
     const child = await this.spawnChild({
       sessionDir: this.ground.sessions,
       sessionName: `subagent-${id}-resume`,
+      cwd: view.cwd,
       provider,
       model,
       thinking,
-      systemPrompt: CHILD_SYSTEM_PROMPT,
+      systemPrompt,
     });
     await this.rejectReplacedSessionChild(generation, child, "resume");
     let sw;
@@ -407,9 +503,13 @@ export class Hub {
       id,
       title: view.title,
       child,
+      agent: view.agent,
+      cwd: view.cwd,
       model,
       provider,
       thinking,
+      systemPrompt,
+      toolPolicy,
       sessionFile,
       turnCount: view.turnCount,
       compactions: view.compactions,

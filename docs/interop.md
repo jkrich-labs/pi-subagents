@@ -2,7 +2,7 @@
 
 How the subagent hub achieves "provider interop exact" without any vendor
 binaries. The authority is pi's own provider abstraction (`hyper`,
-`opencode-go`, custom) — `models/registry.json` records anything per-model.
+`openai-codex`, custom) — `models/registry.json` records anything per-model.
 
 ## Ground rules
 
@@ -21,9 +21,7 @@ xhigh | max`. Providers disagree on what that means:
 
 - **hyper** — per-request reasoning level, hyper-specific tokens map in the
   registry's `thinkingLevelMap`.
-- **opencode-go (OpenAI response shape)** — verified working path pi's
-  model catalog ships; textSignature-annotated completion shape. The
-  registry's `thinkingLevelMap` carries the level translation.
+- **openai-codex** — subscription-backed route for every OpenAI-family model. The registry's `thinkingLevelMap` carries the level translation.
 - **Grok / Composer-style models** — parameterized temperature + effort; the
   registry holds `defaultOverrides` (`temperature`, `top_p`) plus the thinking
   map, so spawning `--thinking <level>` never requires per-model client logic.
@@ -49,5 +47,5 @@ xhigh | max`. Providers disagree on what that means:
 
 | Provider | thinking | temperature/top_p | notes |
 |---|---|---|---|
-| opencode-go | registry `thinkingLevelMap` | `defaultOverrides` | gpt-5.6-luna works cleanly |
+| openai-codex | registry `thinkingLevelMap` | `defaultOverrides` | all OpenAI-family models use the subscription route |
 | hyper | reasoning level per request | `defaultOverrides` | registry maps hyper tokens |

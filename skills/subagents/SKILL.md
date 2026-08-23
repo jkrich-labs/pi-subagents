@@ -20,16 +20,27 @@ delegating/steering children through the hub.
   enforces this — a second steer is refused until the child settles.
 - No caps of any kind. Don't assign turn/token/wall-clock budgets. Done-ness is
   the child's own `DONE-PARENT` or the user's cancel.
-- Child outputs are mail-in, not polled. Read completions / questions when
-  the hub surfaces them in your turn; never make "are you done yet?" calls.
+- Child outputs are mail-in, not polled. Read completions or questions when the hub surfaces them.
+- After spawning, continue only genuinely independent useful work. If the remaining work depends on a child, end your turn immediately.
+- While waiting, never poll, sleep, or manufacture busywork. Do not inspect or kill child processes; the hub owns their lifecycle and delivers completion automatically.
 - Child sessions always persist (`--session-dir`, no `--no-session`), so
   resume rewinds exactly.
 
 ## Commands seen by the parent
 
-- `spawn_subagent` (tool) — call the hub tool when delegating. Provide a title,
-  a complete prompt, optional `model`, `provider`, `thinking`, and whether the
-  child may call `@all`.
+- `spawn_subagent` (tool) — prefer a bundled `agent` name plus a complete prompt. A named call uses its pinned provider, model, thinking level, tools, and role prompt. Explicit `model`, `provider`, or `thinking` values override the preset independently, except OpenAI-family models always use the subscription-backed `openai-codex` provider. Calls without `agent` require `title` and use the `general-purpose` preset. Pass `cwd` for an isolated worktree.
+- `Task` (tool) — Cursor-compatible alias. Pass `subagent_type` and `prompt`; it routes through the same named-agent resolver and accepts `cwd` for an isolated worktree.
+- `steer_subagent` (tool) — send guidance to one live child. Parent models use this instead of emitting visible `@child-id` assistant text; steering a failed child returns its failure immediately.
+- `AwaitShell` (tool) — compatibility yield only. It ends the parent turn and never polls.
+- Bundled agents:
+  - `explorer` — `openai-codex/gpt-5.6-luna`, `medium`
+  - `planner` — `kimi-coding/k3`, `max`
+  - `mechanical-worker` — `openai-codex/gpt-5.6-luna`, `xhigh`
+  - `general-purpose` — `openai-codex/gpt-5.6-terra`, `xhigh`
+  - `senior` — `openai-codex/gpt-5.6-sol`, `xhigh`
+  - `visual-designer` — `hyper/qwen3.8-max`, `high`
+  - `reviewer-standards` — `openai-codex/gpt-5.6-terra`, `xhigh`
+  - `reviewer-spec` — `openai-codex/gpt-5.6-terra`, `xhigh`.
 - On a child, pipe routing awaits on the parent's message stream. Anything the
   parent replies with a routing prefix reaches the dispatcher. Judge routing
   the same way the hub would:
@@ -62,7 +73,9 @@ Children speak codes in their completion. The routing table:
 
 ## User commands (TUI)
 
-- `/subagent spawn <title>` — spawn with prompt from the user.
+- `/subagent agents` — list bundled agents and their provider/model/thinking defaults.
+- `/subagent spawn-agent <agent> <prompt>` — spawn a named agent.
+- `/subagent spawn <title> <prompt>` — spawn a generic child.
 - `/subagent list` — live list with model::thinking, turns, elapsed, badge.
 - `/subagent steer <id> <text>` — parent-less direct steer.
 - `/subagent ask <id> <text>` — answer a pending ask.
@@ -75,7 +88,10 @@ Children speak codes in their completion. The routing table:
 User: "spawn a research child on the pi RPC protocol"
 Parent: spawn_subagent(title="rpc research", prompt="read the pi docs …", model=...)
 
-Child work continues while parent keeps working.
+Parent: steer_subagent(child_id="…", message="focus on the RPC framing seam")
+
+Child work continues while parent keeps working. The parent must not launch `pi`
+through bash, create PID/exit files, or poll with shell sleeps.
 Child: DONE-PARENT — "summary lens …"
 Parent: uses the lens in its own next turn.
 ```

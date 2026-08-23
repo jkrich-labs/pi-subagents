@@ -13,16 +13,16 @@ reads at spawn. The schema below is implemented by the registry loader
   "models": [
     {
       "id": "gpt-5.6-luna",
-      "provider": "opencode-go",
+      "provider": "openai-codex",
       "name": "GPT 5.6 Luna",
       "thinkingLevelMap": {
-        "off": "low",
-        "minimal": "low",
+        "off": "off",
+        "minimal": "minimal",
         "low": "low",
-        "medium": "low",
+        "medium": "medium",
         "high": "high",
-        "xhigh": "high",
-        "max": "high"
+        "xhigh": "xhigh",
+        "max": "max"
       },
       "defaultOverrides": {
         "temperature": 0.7,
@@ -37,7 +37,7 @@ reads at spawn. The schema below is implemented by the registry loader
 
 - `registryEntry.id` — exact model id string, as accepted by
   `pi --model <id>`.
-- `.provider` — provider name the id lives under (hyper, opencode-go, …);
+- `.provider` — provider name the id lives under (hyper, openai-codex, …);
   must match a provider pi knows.
 - `.name` — display name for the ticker/lens/UX.
 - `.thinkingLevelMap` — maps each pi level to the provider token for that
@@ -58,7 +58,7 @@ reads at spawn. The schema below is implemented by the registry loader
 
 | id | provider | thinking token scheme |
 |---|---|---|
-| gpt-5.6-luna | opencode-go | registry thinkingLevelMap |
+| gpt-5.6-luna | openai-codex | registry thinkingLevelMap |
 
 Provider-token facts belong here after S-03 verification; interop prose lives
 in `docs/interop.md`.

@@ -21,7 +21,7 @@ ENV["LINES"] = "40"
 cmd = [
     "pi", "--no-session", "--no-extensions",
     "-e", "./extensions/subagents/index.ts",
-    "--provider", "opencode-go", "--model", "gpt-5.6-luna", "--thinking", "low",
+    "--provider", "openai-codex", "--model", "gpt-5.6-terra", "--thinking", "xhigh",
 ]
 
 master, slave = pty.openpty()
@@ -73,7 +73,7 @@ try:
     child_id = m.group(1) if m else ""
 
     # 3. ticker widget shows the child with model::thinking and turn count
-    ticker = wait_for(r"smoke:\s+\w+ gpt-5\.6-luna::low", 120)
+    ticker = wait_for(r"smoke:\s+\w+ gpt-5\.6-terra::xhigh", 120)
     check("ticker renders status + model::thinking", ticker)
     check("ticker shows turn count (t<N>)", wait_for(r"smoke:.*\bt\d+", 30))
 

@@ -1,6 +1,6 @@
 /**
  * S-03 protocol harness tests — hub↔child RPC boundary.
- * Real `pi --mode rpc` children on the pinned gpt-5.6-luna model (opencode-go).
+ * Real `pi --mode rpc` children on the pinned openai-codex/gpt-5.6-luna model.
  * Run: node --test tests/rpc-child-harness.test.ts
  */
 import { test } from "node:test";
@@ -74,7 +74,11 @@ test("steer queued mid-run is delivered exactly once per settled turn (A5)", { t
     ]);
 
     // One settled agent run: pi delivers the steer between turns inside it.
-    const end = await child.waitFor((l) => l.type === "agent_end", "agent_end");
+    const end = await child.waitFor(
+      (l) => l.type === "agent_end",
+      "agent_end after mid-run steer",
+      60_000,
+    );
     assert.equal(end.willRetry, false);
 
     const msgs = (end.messages ?? []) as Array<Record<string, unknown>>;
@@ -344,15 +348,15 @@ test("set_thinking_level via RPC echoes/valid-clamps (A9/A10 lean)", { timeout: 
     const avail = await child.send("get_available_thinking_levels", {});
     assert.ok(avail.success);
     const levels = (avail.data as { levels?: string[] }).levels ?? [];
-    // gpt-5.6-luna measured fact: floor is "low" — off/minimal are not offered.
-    assert.deepEqual(levels, ["low", "medium", "high", "xhigh", "max"], `model level set: ${levels}`);
+    // openai-codex exposes the full thinking-level range for gpt-5.6-luna.
+    assert.deepEqual(levels, ["off", "minimal", "low", "medium", "high", "xhigh", "max"], `model level set: ${levels}`);
 
     const off = await child.send("set_thinking_level", { level: "off" });
     assert.ok(off.success, `set thinking off accepted: ${off.error ?? ""}`);
     const stateOff = await child.send("get_state", {});
     const clamped = (stateOff.data as { thinkingLevel?: string }).thinkingLevel;
-    assert.ok(levels.includes(clamped ?? ""), `off clamps to a real level: ${clamped}`);
-    console.log(`A9/A10 measured: off clamps to ${clamped} on ${TESTING_MODEL}`);
+    assert.equal(clamped, "off", `off remains available: ${clamped}`);
+    console.log(`A9/A10 measured: off remains off on ${TESTING_PROVIDER}/${TESTING_MODEL}`);
   } finally {
     await child.shutdown();
   }

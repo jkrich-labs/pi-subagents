@@ -29,14 +29,28 @@ export function parseSteerLine(line: string): Steer | null {
   return { target: "child", childId: token, text };
 }
 
-/** All steers in a multi-line message. */
-export function routeSteers(text: string): Steer[] {
-  const out: Steer[] = [];
-  for (const line of text.split("\n")) {
-    const s = parseSteerLine(line);
-    if (s) out.push(s);
+function parseSteerLineAll(line: string): Steer[] {
+  const tokens: string[] = [];
+  let rest = line;
+  for (;;) {
+    const match = /^\s*@(all|[A-Za-z0-9_-]+)\s+(.+)$/.exec(rest);
+    if (!match) break;
+    tokens.push(match[1]);
+    rest = match[2];
+    if (!/^\s*@(?:all|[A-Za-z0-9_-]+)\s+/.test(rest)) break;
   }
-  return out;
+  const message = rest.trim();
+  if (tokens.length === 0 || !message) return [];
+  return tokens.map((token) => {
+    if (token === "all") return { target: "all", text: message };
+    if (token === "user") return { target: "user", text: message };
+    return { target: "child", childId: token, text: message };
+  });
+}
+
+/** All steers in a multi-line message, including multiple targets on one line. */
+export function routeSteers(text: string): Steer[] {
+  return text.split("\n").flatMap(parseSteerLineAll);
 }
 
 /** Strip routing prefixes from a message (used when text continues to the parent). */

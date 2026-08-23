@@ -4,6 +4,7 @@
  * that process only. No companion HTTP server (A1 verified in S-02).
  */
 import { EventEmitter } from "node:events";
+import type { AgentToolPolicy } from "../agents.ts";
 
 export type ChildStatus =
   | "spawning"
@@ -18,9 +19,13 @@ export interface ChildView {
   id: string;
   title: string;
   status: ChildStatus;
+  agent?: string;
+  cwd?: string;
   model?: string;
   provider?: string;
   thinking?: string;
+  systemPrompt?: string;
+  toolPolicy?: AgentToolPolicy;
   spawnedAt: number;
   turnCount: number;
   compactions: number;

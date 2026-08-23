@@ -5,6 +5,7 @@
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { normalizeLaunchSelection } from "./registry.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
@@ -156,12 +157,18 @@ export class AgentRegistry {
       throw new Error(`Invalid thinking ${JSON.stringify(overrides.thinking)}; expected ${THINKING_LEVELS.join(", ")}`);
     }
 
+    const model = nonEmpty(overrides.model) ?? definition.model;
+    const selection = normalizeLaunchSelection(
+      model,
+      nonEmpty(overrides.provider) ?? definition.provider,
+      (explicitThinking as ThinkingLevel | undefined) ?? definition.thinking,
+    );
     return {
       name: definition.name,
       description: definition.description,
-      provider: nonEmpty(overrides.provider) ?? definition.provider,
-      model: nonEmpty(overrides.model) ?? definition.model,
-      thinking: (explicitThinking as ThinkingLevel | undefined) ?? definition.thinking,
+      provider: selection.provider,
+      model: selection.model,
+      thinking: selection.thinking as ThinkingLevel,
       toolPolicy: definition.toolPolicy,
       rolePrompt: definition.rolePrompt,
       systemPrompt: composeAgentSystemPrompt(definition.rolePrompt),

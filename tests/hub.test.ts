@@ -30,6 +30,14 @@ test("routeSteers: parse, route and strip", () => {
   const routed = routeSteers("thinking out loud\n@abc123 steer this\n@all everyone\nplain line");
   assert.deepEqual(routed.map((r) => r.target), ["child", "all"]);
   assert.equal(routed[0].childId, "abc123");
+  assert.deepEqual(
+    routeSteers("@child-one @child-two Send final reports now").map(({ childId, text }) => ({ childId, text })),
+    [
+      { childId: "child-one", text: "Send final reports now" },
+      { childId: "child-two", text: "Send final reports now" },
+    ],
+    "multiple child prefixes on one line steer every named child",
+  );
 
   const stripped = stripSteers("keep me\n@all drop me\n@user drop me too");
   assert.equal(stripped.trim(), "keep me");
@@ -67,6 +75,126 @@ test("registry: model resolution falls back to testing model", () => {
   assert.equal(patched.model, TESTING_MODEL);
   assert.equal(patched.provider, TESTING_PROVIDER);
   assert.equal(patched.thinking, TESTING_THINKING);
+
+  const explicit = resolveSpawn({ model: "gpt-5.6-sol", provider: "openai-codex", thinking: "medium" });
+  assert.deepEqual(explicit, {
+    model: "gpt-5.6-sol",
+    provider: "openai-codex",
+    thinking: "medium",
+  }, "an explicit provider/model pair must not be silently rewritten by the local registry");
+  assert.equal(
+    resolveSpawn({ model: "gpt-5.6-sol", provider: "hyper" }).provider,
+    "openai-codex",
+    "OpenAI-family models cannot bypass the subscription-backed provider",
+  );
+  assert.deepEqual(
+    resolveSpawn({ model: "cursor-grok-4.6-fast", provider: "cursor", thinking: "high" }),
+    { model: "gpt-5.6-terra", provider: "openai-codex", thinking: "xhigh" },
+    "retired Grok 4.6 launches migrate at the final generic launch boundary",
+  );
+});
+
+function recordingChildren() {
+  const launches: RpcChildOptions[] = [];
+  const commands: Array<{ command: string; body: Record<string, unknown> }> = [];
+  let spawnCount = 0;
+  const spawnChild = async (opts: RpcChildOptions): Promise<RpcChildHandle> => {
+    launches.push({ ...opts });
+    spawnCount += 1;
+    let running = true;
+    const lines: WireLine[] = [];
+    return {
+      proc: { pid: 10_000 + spawnCount },
+      lines,
+      sessionFile: `/sessions/child-${spawnCount}.jsonl`,
+      onExit: null,
+      setLineHandler() {},
+      async send(command: string, body: Record<string, unknown> = {}): Promise<CommandResponse> {
+        commands.push({ command, body });
+        return { command, success: true };
+      },
+      events(type: string) { return lines.filter((line) => line.type === type); },
+      isRunning() { return running; },
+      kill() { running = false; },
+      async shutdown() { running = false; },
+    };
+  };
+  return { launches, commands, spawnChild, get spawnCount() { return spawnCount; } };
+}
+
+test("hub: named launch reaches ring and resume preserves resolved preset configuration", async () => {
+  ring.reset();
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: () => {}, spawnChild: recorder.spawnChild });
+
+  const cwd = "/tmp/isolated-worktree";
+  const id = await hub.spawn({ agent: "explorer", prompt: "Map the launch path", cwd });
+  const view = hub.getView(id)!;
+  assert.equal(view.title, "explorer", "named calls may omit title");
+  assert.equal(view.agent, "explorer");
+  assert.equal(view.provider, "openai-codex");
+  assert.equal(view.model, "gpt-5.6-luna");
+  assert.equal(view.thinking, "medium");
+  assert.equal(view.toolPolicy, "normal");
+  assert.ok(view.systemPrompt?.includes("Read repository context"), "ring retains the composed role prompt");
+  assert.equal(recorder.launches[0].systemPrompt, view.systemPrompt);
+  assert.equal(recorder.launches[0].cwd, cwd, "named agents launch directly in their assigned worktree");
+
+  await hub.kill(id);
+  assert.equal(await hub.resume(id, "Continue the exploration"), true);
+  assert.deepEqual(recorder.launches[1], {
+    sessionDir: hub.ground.sessions,
+    sessionName: `subagent-${id}-resume`,
+    provider: view.provider,
+    model: view.model,
+    thinking: view.thinking,
+    systemPrompt: view.systemPrompt,
+    cwd,
+  });
+  assert.ok(recorder.commands.some((entry) => entry.command === "switch_session"));
+  await hub.shutdownAll();
+});
+
+test("hub: generic launch uses the general-purpose preset and unknown agents fail before process creation", async () => {
+  ring.reset();
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: () => {}, spawnChild: recorder.spawnChild });
+
+  const id = await hub.spawn({ title: "generic", prompt: "Do generic work" });
+  assert.equal(hub.getView(id)?.agent, "general-purpose");
+  assert.equal(hub.getView(id)?.provider, "openai-codex");
+  assert.equal(hub.getView(id)?.model, "gpt-5.6-terra");
+  assert.equal(hub.getView(id)?.thinking, "xhigh");
+  assert.equal(hub.getView(id)?.toolPolicy, "normal");
+  assert.ok(hub.getView(id)?.systemPrompt?.includes("Own the assigned engineering slice"));
+  await assert.rejects(hub.spawn({ agent: "not-real", prompt: "Never starts" }), /unknown agent.*explorer.*reviewer-spec/i);
+  assert.equal(recorder.spawnCount, 1, "unknown agent did not call the child factory");
+  await hub.shutdownAll();
+});
+
+test("hub: rejects a retry title while the original child is still live", async () => {
+  ring.reset();
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: () => {}, spawnChild: recorder.spawnChild });
+
+  const id = await hub.spawn({ title: "Review S-01 standards", prompt: "Review" });
+  await assert.rejects(
+    hub.spawn({ title: "Review S-01 standards retry", prompt: "Review again" }),
+    new RegExp(`already working.*${id}`, "i"),
+  );
+  assert.equal(recorder.spawnCount, 1, "duplicate retry did not start another process");
+  await hub.shutdownAll();
+});
+
+test("hub: reports ownership only for live child PIDs", async () => {
+  ring.reset();
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: () => {}, spawnChild: recorder.spawnChild });
+  const id = await hub.spawn({ title: "owned", prompt: "Work" });
+  assert.equal(hub.ownsProcess(10_001), true);
+  assert.equal(hub.ownsProcess(99_999), false);
+  await hub.kill(id);
+  assert.equal(hub.ownsProcess(10_001), false);
 });
 
 test("hub: session shutdown suppresses stale-context delivery and clears the old fleet", async () => {
@@ -182,6 +310,44 @@ test("hub: a resume crossing session replacement is discarded", async () => {
   assert.deepEqual(ring.list(), []);
 });
 
+test("hub: resume migrates stale Grok 4.6 ring state before process launch", async () => {
+  ring.reset();
+  const id = "resume-retired-grok";
+  ring.upsert(id, {
+    id,
+    title: "old review",
+    status: "failed",
+    sessionFile: "/sessions/old-grok.jsonl",
+    provider: "cursor",
+    model: "cursor-grok-4.6-fast",
+    thinking: "high",
+    spawnedAt: Date.now(),
+  });
+  let launched: RpcChildOptions | undefined;
+  const child: RpcChildHandle = {
+    proc: { pid: 12_349 },
+    lines: [],
+    onExit: null,
+    setLineHandler() {},
+    async send(command: string): Promise<CommandResponse> { return { command, success: true }; },
+    events() { return []; },
+    isRunning() { return true; },
+    kill() {},
+    async shutdown() {},
+  };
+  const hub = new Hub({
+    ground: tmpGround(),
+    deliver: () => {},
+    spawnChild: async (opts) => { launched = opts; return child; },
+  });
+
+  assert.equal(await hub.resume(id, "continue"), true);
+  assert.equal(launched?.provider, "openai-codex");
+  assert.equal(launched?.model, "gpt-5.6-terra");
+  assert.equal(launched?.thinking, "xhigh");
+  await hub.shutdownAll();
+});
+
 test("hub: a rejected resume switch cleans up the unregistered child", async () => {
   ring.reset();
   const id = "resume-switch-error";
@@ -263,6 +429,11 @@ test("hub: a settled provider error becomes failed instead of remaining working"
   assert.equal(hub.getView(id)?.status, "failed");
   assert.equal(hub.getView(id)?.error, "model is not supported by provider");
   assert.equal(deliveries.filter((delivery) => delivery.type === "crash").length, 1);
+  await assert.rejects(
+    hub.spawn({ title: "unsupported retry under another title", prompt: "run again" }),
+    /already failed as unsupported; choose a supported preset instead of retrying/,
+    "an unsupported provider/model pair trips a session-local circuit breaker",
+  );
 
   const exitAfterFailure = child.onExit;
   exitAfterFailure?.();

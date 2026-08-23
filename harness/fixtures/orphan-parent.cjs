@@ -15,7 +15,7 @@ const child = spawn(
   [
     "--mode", "rpc", "--no-tools", "--no-extensions", "--no-skills",
     "--no-prompt-templates", "--no-themes", "--no-context-files",
-    "--provider", "opencode-go", "--model", "gpt-5.6-luna",
+    "--provider", "openai-codex", "--model", "gpt-5.6-luna",
     "--session-dir", sessionDir,
   ],
   { stdio: ["pipe", "pipe", "inherit"] }

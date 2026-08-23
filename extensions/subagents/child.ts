@@ -11,6 +11,8 @@ export type WireLine = Record<string, unknown>;
 export interface RpcChildOptions {
   sessionDir: string;
   sessionName?: string;
+  /** Working directory inherited by every child tool call. */
+  cwd?: string;
   provider?: string;
   model?: string;
   thinking?: string;
@@ -84,7 +86,10 @@ export class RpcChild implements RpcChildHandle {
   }
 
   static async spawnChild(opts: RpcChildOptions): Promise<RpcChild> {
-    const proc = spawn("pi", buildChildArgs(opts), { stdio: ["pipe", "pipe", "pipe"] });
+    const proc = spawn("pi", buildChildArgs(opts), {
+      cwd: opts.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     const child = new RpcChild(proc);
     child.captureStderr();
     const ok = await child.send("get_state", {}, 8000);

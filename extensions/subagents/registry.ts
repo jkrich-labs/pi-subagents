@@ -34,46 +34,57 @@ export function loadRegistry(): RegistryModel[] {
 
 const loaded = loadRegistry();
 
-/** Providers the registry names, plus pi's known-good built-ins. */
-export function knownProviders(): Set<string> {
-  const set = new Set<string>(["hyper"]);
-  for (const m of loaded) {
-    if (m.provider) set.add(m.provider);
-  }
-  return set;
-}
-
 export function findModel(id: string): RegistryModel | undefined {
   return loaded.find((m) => m.id === id);
 }
 
-/** Resolve spawn model info: explicit args win, then registry, then defaults.
- *  Sanity: junk verbatim tokens ("default", "testing", …) from an LLM are
- *  dropped to the registry defaults; thinking must be a real level. */
+const RETIRED_GROK_46 = /(?:^|[\/_-])grok-?4[.-]6(?:$|[\/_-])/i;
+
+export function normalizeLaunchSelection(model: string, provider: string, thinking: string): {
+  model: string;
+  provider: string;
+  thinking: string;
+} {
+  if (RETIRED_GROK_46.test(model)) {
+    return {
+      model: "gpt-5.6-terra",
+      provider: "openai-codex",
+      thinking: "xhigh",
+    };
+  }
+  const id = model.toLowerCase().split("/").at(-1) ?? "";
+  const isOpenAI = model.toLowerCase().startsWith("openai/") || /^(?:gpt(?:-|$)|o[1-9](?:-|$)|codex(?:-|$))/.test(id);
+  return { model, provider: isOpenAI ? "openai-codex" : provider, thinking };
+}
+
+export function providerForModel(model: string, provider: string): string {
+  return normalizeLaunchSelection(model, provider, "low").provider;
+}
+
+/** Resolve legacy/default launch settings for old persisted children.
+ * Placeholder tokens from an LLM are dropped; a real explicit provider passes through unchanged. */
 export function resolveSpawn(req: { model?: string; provider?: string; thinking?: string }): {
   model: string;
   provider: string;
   thinking: string;
 } {
   const defaultModel = process.env.SUBAGENT_MODEL ?? process.env.SUBAGENT_DEFAULT_MODEL ?? "gpt-5.6-luna";
-  const defaultProvider = process.env.SUBAGENT_PROVIDER ?? "opencode-go";
+  const defaultProvider = process.env.SUBAGENT_PROVIDER ?? "openai-codex";
 
   let model = req.model?.trim() ?? "";
   if (model === "" || /^(default|testing|none|auto)$/i.test(model)) model = defaultModel;
   const reg = findModel(model);
 
   let provider = req.provider?.trim() ?? "";
-  const DROP = /^(default|testing|none|auto)$/i;
+  const DROP = /^(default|testing|none|auto|registry)$/i;
   if (provider === "" || DROP.test(provider)) {
     provider = reg?.provider ?? defaultProvider;
-  } else if (!knownProviders().has(provider)) {
-    // Junk tokens from the LLM (e.g. "registry") must never reach spawn.
-    provider = reg?.provider ?? defaultProvider;
   }
+  provider = providerForModel(model, provider);
 
   const LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   let thinking = req.thinking?.trim().toLowerCase() ?? "";
   if (!LEVELS.has(thinking)) thinking = process.env.SUBAGENT_THINKING ?? "low";
 
-  return { model, provider, thinking };
+  return normalizeLaunchSelection(model, provider, thinking);
 }

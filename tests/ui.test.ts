@@ -18,7 +18,14 @@ import {
 import { blankView, ring, type ChildView } from "../extensions/subagents/ring/store.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { openFleetOverlay } from "../extensions/subagents/ui/overlay.ts";
-import subagentsExtension from "../extensions/subagents/index.ts";
+import subagentsExtension, {
+  mapTaskRequest,
+  parentBashGuard,
+  spawnSuccessText,
+  spawnToolResult,
+  subagentCommand,
+  deliverToParent,
+} from "../extensions/subagents/index.ts";
 import { attachFleetEditorNavigation, FleetWidget } from "../extensions/subagents/ui/focus.ts";
 
 function view(patch: Partial<ChildView>): ChildView {
@@ -439,6 +446,131 @@ test("extension installs focus navigation without a raw terminal listener", asyn
   await new Promise<void>((resolve) => setTimeout(resolve, 300));
   assert.equal(statusUpdates, updatesBeforeShutdown, "queued renders are cancelled before session context becomes stale");
   ring.reset();
+});
+
+test("extension prevents parent polling and exposes Cursor-compatible delegation tools", async () => {
+  const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+  const tools = new Map<string, any>();
+  const pi = {
+    on(event: string, handler: (...args: any[]) => unknown) {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
+    registerTool(tool: any) { tools.set(tool.name, tool); },
+    registerCommand() {},
+    appendEntry() {},
+    sendUserMessage() {},
+  } as any;
+
+  subagentsExtension(pi);
+  const spawnTool = tools.get("spawn_subagent");
+  assert.ok(
+    spawnTool.promptGuidelines?.some((line: string) => /do not.*(?:sleep|poll).*end.*turn/i.test(line)),
+    "the model-visible spawn contract tells the parent to end its turn rather than poll",
+  );
+  assert.ok(tools.has("Task"), "Cursor-trained models receive the Task delegation affordance");
+  assert.ok(tools.has("AwaitShell"), "Cursor-trained models receive a safe AwaitShell compatibility affordance");
+  assert.ok(tools.has("steer_subagent"), "parents can steer without leaking @child control text into assistant output");
+  assert.ok(
+    tools.get("steer_subagent").promptGuidelines?.some((line: string) => /never emit.*@child/i.test(line)),
+    "the model-visible steering contract forbids assistant-text control messages",
+  );
+  assert.deepEqual(mapTaskRequest({ subagent_type: "reviewer-spec", prompt: "Review it", cwd: "/tmp/review-wt" }), {
+    agent: "reviewer-spec",
+    prompt: "Review it",
+    cwd: "/tmp/review-wt",
+  });
+  assert.match(spawnSuccessText("child-1", "reviewer-spec"), /end (?:the |your )?turn.*(?:never|do not).*(?:poll|sleep)/i);
+  assert.match(spawnSuccessText("child-1", "reviewer-spec"), /steer_subagent\(child_id="child-1"/);
+  assert.equal(spawnToolResult("child-1", "reviewer-spec", "reviewer-spec").terminate, true);
+  ring.upsert("failed-child", { title: "review", status: "failed", error: "model is not supported by provider" });
+  assert.match(
+    (await tools.get("steer_subagent").execute("call", { child_id: "failed-child", message: "report now" })).content[0].text,
+    /failed.*model is not supported by provider/i,
+    "steering a failed child reports the failure to the parent immediately",
+  );
+  ring.reset();
+  assert.deepEqual(await tools.get("AwaitShell").execute(), {
+    content: [{ type: "text", text: "Background tasks report completion automatically. End this turn now; do not poll or sleep." }],
+    details: {},
+    terminate: true,
+  });
+
+  ring.reset();
+  ring.upsert("working-child", { title: "background work", status: "working" });
+  const guard = (handlers.get("tool_call") ?? [])[0];
+  assert.ok(guard, "the extension registers a tool-call polling guard");
+  const decision = await guard(
+    { toolName: "bash", toolCallId: "wait-1", input: { command: "sleep 8; echo waiting" } },
+    {},
+  );
+  assert.deepEqual(decision, {
+    block: true,
+    reason: "A subagent is still working in the background. Do not poll with shell sleeps; end this turn instead.",
+    terminate: true,
+  });
+  ring.reset();
+});
+
+test("child failures become model-visible follow-up messages", () => {
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const messages: Array<{ text: string; options: unknown }> = [];
+  const pi = {
+    appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
+    sendUserMessage(text: string, options: unknown) { messages.push({ text, options }); },
+  } as any;
+
+  deliverToParent(pi, {
+    type: "crash",
+    childId: "failed-child",
+    reason: "model is not supported by provider",
+  });
+  assert.equal(entries[0].type, "subagent_crash");
+  assert.match(messages[0].text, /failed-child.*FAILED.*model is not supported.*do not retry/i);
+  assert.deepEqual(messages[0].options, { deliverAs: "followUp" });
+});
+
+test("manual commands list presets and launch a named agent", async () => {
+  const notices: string[] = [];
+  const spawns: any[] = [];
+  const ctx = { ui: { notify(message: string) { notices.push(message); } } } as any;
+  const hub = { async spawn(request: unknown) { spawns.push(request); return "child-1"; } } as any;
+
+  await subagentCommand({} as any, hub, ctx, "agents");
+  assert.ok(notices[0].includes("explorer openai-codex/gpt-5.6-luna medium"));
+  assert.ok(notices[0].includes("reviewer-spec openai-codex/gpt-5.6-terra xhigh"));
+
+  await subagentCommand({} as any, hub, ctx, "spawn-agent reviewer-spec Review S-01");
+  assert.deepEqual(spawns, [{ agent: "reviewer-spec", prompt: "Review S-01" }]);
+  assert.equal(notices.at(-1), "spawned child-1 (reviewer-spec)");
+});
+
+test("parent bash guard blocks raw delegation, polling, and hub-owned kills", () => {
+  const reason = "A subagent is still working in the background. Do not poll with shell sleeps; end this turn instead.";
+  assert.deepEqual(parentBashGuard("sleep 20; ps -ef", true, () => false), {
+    block: true,
+    reason,
+    terminate: true,
+  });
+  assert.deepEqual(parentBashGuard("kill 90838 90839; sleep 1", true, (pid) => pid === 90839), {
+    block: true,
+    reason: "Child processes are owned by the subagent hub. Do not shell-kill them or spawn duplicate retries; end this turn instead.",
+    terminate: true,
+  });
+  assert.equal(parentBashGuard("kill 123", true, () => false), undefined, "unrelated process control is untouched");
+  assert.equal(parentBashGuard("sleep 1; npm test", true, () => false), undefined, "a test command containing sleep is not polling");
+  assert.deepEqual(parentBashGuard("sleep 20; ps -ef", false, () => false), {
+    block: true,
+    reason: "Do not poll background work with shell sleeps or PID checks. Delegate through Task/spawn_subagent and end this turn.",
+    terminate: true,
+  }, "polling is blocked even when work bypassed the hub");
+  assert.deepEqual(parentBashGuard("(cd /tmp/wt && pi -p --no-session --model gpt-5.6-sol 'fix') > report 2>&1 & echo $! > child-pid", false, () => false), {
+    block: true,
+    reason: "Do not launch nested pi agents through bash or manage their PID files. Use Task/spawn_subagent with cwd instead.",
+    terminate: true,
+  });
+  assert.equal(parentBashGuard("pi --list-models", false, () => false), undefined, "non-agent pi diagnostics remain available");
 });
 
 test("fleet overlay stays active through a selected child inspection", async () => {
