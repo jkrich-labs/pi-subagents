@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      # pi itself must be on PATH: the hub and harness spawn `pi --mode rpc`
+      # children. Installed globally at the pinned version.
+      - run: npm install -g @earendil-works/pi-coding-agent@0.84.2
+
+      - run: npx tsc --noEmit -p tsconfig.json
+
+      # Pure unit tests — no child processes, no provider auth needed.
+      - run: node --test tests/ui.test.ts
+
+      # Model-backed suites (hub / liveness / rpc-child-harness) spawn real
+      # `pi --mode rpc` children against opencode-go/gpt-5.6-luna and need
+      # provider auth. Gated on the MODEL_TESTS repo variable so forks and
+      # doc-only PRs stay green; enable it once the runner has credentials.
+      - name: model-backed suites
+        if: vars.MODEL_TESTS == 'true'
+        run: node --test tests/hub.test.ts tests/liveness.test.ts tests/rpc-child-harness.test.ts

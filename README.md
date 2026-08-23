@@ -11,21 +11,49 @@ wall-clock caps anywhere.
 - **[docs/interop.md](docs/interop.md)** — provider interop (hyper / opencode-go / grok thinking + temperature maps).
 - **[docs/provider-maps.md](docs/provider-maps.md)** — `models/registry.json` format reference.
 
-## Development
+## Quickstart
+
+Prerequisites:
+
+- **pi 0.84.2** on `PATH` (`npm install -g @earendil-works/pi-coding-agent@0.84.2`)
+- **Node 24+** (tests run on `node --test` with native TypeScript stripping)
+- Provider auth for the child model, same as an interactive pi run
+  (tests and the registry default pin `gpt-5.6-luna` via `opencode-go`)
+
+Then:
 
 ```bash
 npm install
-npm run typecheck       # tsc --noEmit
+make verify        # tsc typecheck + all test suites (spawns real pi children)
+make unit          # pure unit tests only — no children, no provider auth
+make smoke         # scripted PTY smoke of the TUI (scripts/smoke-tui.py)
 ```
 
-## Install (when the hub ships)
+## Install the hub
 
 ```bash
-pi install /path/to/pi-subagents
-# or: ln -s …/pi-subagents/extensions/subagents ~/.pi/agent/extensions/subagents
+ln -s "$PWD/extensions/subagents" ~/.pi/agent/extensions/subagents
+# or run pi from this repo: package.json's "pi.extensions" loads ./extensions/subagents
 ```
+
+## Use
+
+- The parent agent calls the `spawn_subagent` tool, or you run
+  `/subagent spawn <title> <prompt>`.
+- Steer from the parent with `@<child-id> <message>` (`@all` broadcasts,
+  `@user` strips back to a normal parent message).
+- The **ticker** above the editor shows each child: status, model::thinking,
+  turns, compactions, elapsed, last completion, ask/loop/stall badges.
+  While the parent is streaming, **Enter** opens the fleet overlay.
+- `/subagent list | inspect <id> | navigate <id> | kill <id> | resume <id>` —
+  inspect/navigate open the Markdown conversation overlay over the child's own
+  session file (chrono/jump/entry-id navigation, `c` copies an entry).
+- Children end only on their own `DONE-PARENT` or your cancel; crashes and
+  transport-dead children get tombstones under the subagent ground and are
+  resumable (`/subagent resume <id>`).
 
 ## Status
 
-Under construction — see the slice plan (`.scratch/pi-subagents/plan.md`). No
-downloadable artifact yet.
+All planned slices implemented (spike → harness → hub/ring → liveness → TUI →
+verify). See `.scratch/pi-subagents/plan.md` for the spec and acceptance
+evidence per slice.
