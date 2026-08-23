@@ -42,9 +42,13 @@ ln -s "$PWD/extensions/subagents" ~/.pi/agent/extensions/subagents
   `/subagent spawn <title> <prompt>`.
 - Steer from the parent with `@<child-id> <message>` (`@all` broadcasts,
   `@user` strips back to a normal parent message).
-- The **ticker** above the editor shows each child: status, model::thinking,
-  turns, compactions, elapsed, last completion, ask/loop/stall badges.
-  While the parent is streaming, **Enter** opens the fleet overlay.
+- Children have pi's normal built-in tools enabled; unrelated extensions and
+  skills remain disabled for isolation.
+- The focusable **fleet ticker** below the editor shows each child: status,
+  model::thinking, turns, compactions, elapsed, last completion, and badges.
+  Press **Down** when editor navigation is exhausted to enter it, use Up/Down
+  to select a child, **Enter** to inspect, and **Up** above the first row to
+  return to the editor. Focused dialogs keep their own Enter and arrow keys.
 - `/subagent list | inspect <id> | navigate <id> | kill <id> | resume <id>` —
   inspect/navigate open the Markdown conversation overlay over the child's own
   session file (chrono/jump/entry-id navigation, `c` copies an entry).

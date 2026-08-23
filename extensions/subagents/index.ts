@@ -4,16 +4,16 @@
  * assistant text), and delivers child lenses to the parent transcript via
  * appendEntry. Headless-safe: UI calls are gated on ctx.mode === "tui".
  */
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Ground } from "./ground.ts";
 import { Hub, type Delivery, type SpawnRequest } from "./hub.ts";
 import { LivenessEngine } from "./liveness/engine.ts";
 import { ring } from "./ring/store.ts";
 import { routeSteers, stripSteers } from "./route.ts";
-import { renderTicker } from "./ui/ticker.ts";
-import { createBusyStreamEnterHandler, type SessionEntryLike } from "./ui/inspect.ts";
-import { openFleetOverlay, openInspectOverlay, openNavigateOverlay } from "./ui/overlay.ts";
+import { type SessionEntryLike } from "./ui/inspect.ts";
+import { openInspectOverlay, openNavigateOverlay } from "./ui/overlay.ts";
+import { attachFleetEditorNavigation, FleetWidget, supportsFleetEditorNavigation } from "./ui/focus.ts";
 import { readFileSync } from "node:fs";
 
 function extractText(msg: Record<string, unknown>): string {
@@ -30,6 +30,7 @@ export default function (pi: ExtensionAPI) {
   const hub = new Hub({ ground, deliver: (d: Delivery) => deliverToParent(pi, d) });
   const engine = new LivenessEngine(hub, ground.tombstones);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let stopTui: (() => void) | null = null;
 
   const poll = (): void => {
     hub.poll();
@@ -41,6 +42,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    stopTui?.();
+    stopTui = null;
     if (pollTimer !== null) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -136,36 +139,62 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // --- S-05 TUI wiring: live ticker + footer status + busy-stream enter ---
-  let parentBusy = false;
-  pi.on("agent_start", () => {
-    parentBusy = true;
-  });
-  pi.on("agent_end", () => {
-    parentBusy = false;
-  });
-  pi.on("agent_settled", () => {
-    parentBusy = false;
-  });
-
+  // --- TUI wiring: focusable fleet immediately below the active editor ---
   pi.on("session_start", (_event, ctx) => {
+    stopTui?.();
+    stopTui = null;
     if (ctx.mode !== "tui") return;
     let scheduled = false;
+    let disposed = false;
+    let pendingRender: ReturnType<typeof setTimeout> | null = null;
+    const previousEditorFactory = ctx.ui.getEditorComponent();
+    let fleet!: FleetWidget;
+
+    ctx.ui.setWidget("subagents", (tui, theme) => {
+      fleet = new FleetWidget(
+        tui,
+        theme,
+        () => ring.list(),
+        async (id) => {
+          const child = ring.get(id);
+          const entries = loadEntriesFromFile(child?.sessionFile);
+          if (!child || !entries) {
+            ctx.ui.notify(`${id}: no session file to inspect`, "warning");
+            return;
+          }
+          await openInspectOverlay(ctx, child, entries);
+        },
+        () => ctx.ui.notify("child conversation failed to open", "warning"),
+      );
+      return fleet;
+    }, { placement: "belowEditor" });
+
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+      const editor = previousEditorFactory
+        ? previousEditorFactory(tui, theme, keybindings)
+        : new CustomEditor(tui, theme, keybindings);
+      fleet.setEditor(editor, keybindings);
+      if (!previousEditorFactory || supportsFleetEditorNavigation(editor)) {
+        attachFleetEditorNavigation(editor, tui, keybindings, fleet);
+      }
+      return editor;
+    });
+
     const render = (): void => {
       const kids = ring.list();
-      const lines = renderTicker(kids);
-      ctx.ui.setWidget("subagents", lines.length > 0 ? lines : undefined);
+      fleet.refresh();
       const active = kids.filter((k) => k.status === "working" || k.status === "asking").length;
       ctx.ui.setStatus("subagents", kids.length > 0 ? `subagents: ${active}/${kids.length}` : undefined);
     };
     // Ring events throttle to ≤1 render per 250ms; a 1s freshness tick keeps
     // elapsed fields moving while children exist (never blocks the parent).
     const throttled = (): void => {
-      if (scheduled) return;
+      if (scheduled || disposed) return;
       scheduled = true;
-      setTimeout(() => {
+      pendingRender = setTimeout(() => {
+        pendingRender = null;
         scheduled = false;
-        render();
+        if (!disposed) render();
       }, 250);
     };
     ring.on("update", throttled);
@@ -173,23 +202,16 @@ export default function (pi: ExtensionAPI) {
     const tick = setInterval(() => {
       if (ring.list().length > 0) render();
     }, 1000);
-    // Busy-stream enter: while the parent streams, enter opens the fleet
-    // overlay instead of queuing editor text. The handler owns the full nested
-    // overlay promise so Enter inside a visible overlay is never recaptured.
-    const handleBusyStreamEnter = createBusyStreamEnterHandler({
-      isParentBusy: () => parentBusy,
-      childCount: () => ring.list().length,
-      openOverlay: () => openFleetOverlay(ctx, ring.list(), (id) => loadEntriesFromFile(ring.get(id)?.sessionFile)),
-      onError: () => ctx.ui.notify("overlay failed to open", "warning"),
-    });
-    const unsubInput = ctx.ui.onTerminalInput(handleBusyStreamEnter);
     render();
-    pi.on("session_shutdown", () => {
+    stopTui = () => {
+      disposed = true;
       clearInterval(tick);
+      if (pendingRender !== null) clearTimeout(pendingRender);
+      pendingRender = null;
+      scheduled = false;
       ring.off("update", throttled);
       ring.off("remove", throttled);
-      unsubInput();
-    });
+    };
   });
 
   // `/subagent` user command.

@@ -1,6 +1,6 @@
 /**
  * S-05 UI seam tests — pure render factories (state → lines), conversation
- * segments, pager navigation, and the busy-stream enter decision.
+ * segments, pager navigation, and editor-to-fleet focus navigation.
  * Integration of ctx.ui.setWidget / ctx.ui.custom stays manual-smoke (plan,
  * Testing Decisions); these tests pin the pure logic the TUI layer renders.
  */
@@ -13,12 +13,13 @@ import {
   segmentOf,
   segmentMarkdown,
   Pager,
-  createBusyStreamEnterHandler,
-  shouldConsumeEnter,
   type SessionEntryLike,
 } from "../extensions/subagents/ui/inspect.ts";
-import { blankView, type ChildView } from "../extensions/subagents/ring/store.ts";
+import { blankView, ring, type ChildView } from "../extensions/subagents/ring/store.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { openFleetOverlay } from "../extensions/subagents/ui/overlay.ts";
+import subagentsExtension from "../extensions/subagents/index.ts";
+import { attachFleetEditorNavigation, FleetWidget } from "../extensions/subagents/ui/focus.ts";
 
 function view(patch: Partial<ChildView>): ChildView {
   return { ...blankView(), id: "abc123def456", title: "demo", ...patch };
@@ -165,42 +166,282 @@ test("pager: current entry is the copiable one", () => {
   assert.equal(p.current()?.entryId, "e1");
 });
 
-// ---------- busy-stream enter passthrough ----------
+// ---------- editor ↔ fleet focus navigation ----------
 
-test("shouldConsumeEnter: only busy + enter + children", () => {
-  assert.equal(shouldConsumeEnter("\r", true, 2), true);
-  assert.equal(shouldConsumeEnter("\r", false, 2), false, "idle → editor keeps enter");
-  assert.equal(shouldConsumeEnter("\r", true, 0), false, "no children → nothing to open");
-  assert.equal(shouldConsumeEnter("x", true, 2), false, "other keys pass through");
-  assert.equal(shouldConsumeEnter("\r\n", true, 1), true, "CRLF enter accepted");
-});
-
-test("busy-stream Enter handler ignores Enter while its overlay promise is active", async () => {
-  let opens = 0;
-  let closeOverlay!: () => void;
-  const handler = createBusyStreamEnterHandler({
-    isParentBusy: () => true,
-    childCount: () => 2,
-    openOverlay: () => {
-      opens += 1;
-      return new Promise<void>((resolve) => { closeOverlay = resolve; });
+test("Down enters the fleet only after native editor navigation is exhausted", () => {
+  let focused: unknown;
+  let cursor = { line: 0, col: 3 };
+  const fleet = { hasRows: () => true };
+  const editor = {
+    getText: () => "abc",
+    getCursor: () => cursor,
+    isShowingAutocomplete: () => false,
+    handleInput(data: string) {
+      if (data === "down" && cursor.col < 3) cursor = { line: 0, col: 3 };
     },
-    onError() {},
-  });
+  };
+  const tui = { setFocus(component: unknown) { focused = component; } };
+  const keys = { matches: (data: string, action: string) => data === "down" && action === "tui.editor.cursorDown" };
+  attachFleetEditorNavigation(editor, tui, keys, fleet);
 
-  assert.deepEqual(handler("\r"), { consume: true });
-  assert.equal(opens, 1);
-  assert.equal(handler("\r"), undefined, "visible overlay owns Enter; global handler passes it through");
-  assert.equal(opens, 1, "a second overlay was not opened behind the first");
-
-  closeOverlay();
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(handler("\r"), { consume: true }, "handler reactivates only after the overlay closes");
-  assert.equal(opens, 2);
-  closeOverlay();
+  cursor = { line: 0, col: 1 };
+  editor.handleInput("down");
+  assert.equal(focused, undefined, "native cursor movement wins");
+  editor.handleInput("down");
+  assert.equal(focused, fleet, "an exhausted Down moves focus below the editor");
 });
 
-test("fleet overlay stays active through a selected child so global Enter capture cannot reactivate", async () => {
+test("fleet ticker truncates long rows to the available terminal width", () => {
+  const tui = { setFocus() {}, requestRender() {} } as any;
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+  const widget = new FleetWidget(
+    tui,
+    theme,
+    () => [view({ title: "x".repeat(200), model: "model-with-a-very-long-name" })],
+    async () => {},
+  );
+  assert.ok(widget.render(24).every((line) => visibleWidth(line) <= 24));
+});
+
+test("Down does not enter the fleet when editor history state changes invisibly", () => {
+  let focused: unknown;
+  const editor = {
+    historyIndex: 0,
+    getText: () => "same draft",
+    getCursor: () => ({ line: 0, col: 10 }),
+    isShowingAutocomplete: () => false,
+    handleInput(_data: string) { editor.historyIndex = -1; },
+  };
+  attachFleetEditorNavigation(
+    editor,
+    { setFocus(component: unknown) { focused = component; } },
+    { matches: (_data: string, action: string) => action === "tui.editor.cursorDown" },
+    { hasRows: () => true },
+  );
+
+  editor.handleInput("down");
+  assert.equal(focused, undefined, "restoring an identical history draft still consumes Down natively");
+});
+
+test("native editor boundary hands off on one Down without mutating hidden state", () => {
+  let focused: unknown;
+  let nativeInputs = 0;
+  const editor = {
+    historyIndex: -1,
+    actionHandlers: new Map(),
+    isOnLastVisualLine: () => true,
+    getText: () => "ready",
+    getCursor: () => ({ line: 0, col: 5 }),
+    isShowingAutocomplete: () => false,
+    handleInput(_data: string) { nativeInputs += 1; },
+  };
+  const fleet = { hasRows: () => true };
+  attachFleetEditorNavigation(
+    editor,
+    { setFocus(component: unknown) { focused = component; } },
+    { matches: (_data: string, action: string) => action === "tui.editor.cursorDown" },
+    fleet,
+  );
+
+  editor.handleInput("down");
+  assert.equal(focused, fleet);
+  assert.equal(nativeInputs, 0, "boundary handoff does not rely on native hidden-state mutations");
+});
+
+test("Down does not enter the fleet while autocomplete is pending", () => {
+  let focused: unknown;
+  const editor = {
+    autocompleteDebounceTimer: {},
+    getText: () => "@file",
+    getCursor: () => ({ line: 0, col: 5 }),
+    isShowingAutocomplete: () => false,
+    handleInput(_data: string) {},
+  };
+  attachFleetEditorNavigation(
+    editor,
+    { setFocus(component: unknown) { focused = component; } },
+    { matches: (_data: string, action: string) => action === "tui.editor.cursorDown" },
+    { hasRows: () => true },
+  );
+
+  editor.handleInput("down");
+  assert.equal(focused, undefined, "a delayed autocomplete result must retain editor ownership");
+});
+
+test("queued autocomplete requests retain editor ownership until settled", async () => {
+  let focused: unknown;
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const editor = {
+    getText: () => "@file",
+    getCursor: () => ({ line: 0, col: 5 }),
+    isShowingAutocomplete: () => false,
+    async startAutocompleteRequest() { await pending; },
+    handleInput(_data: string) {},
+  };
+  attachFleetEditorNavigation(
+    editor,
+    { setFocus(component: unknown) { focused = component; } },
+    { matches: (_data: string, action: string) => action === "tui.editor.cursorDown" },
+    { hasRows: () => true },
+  );
+
+  const request = editor.startAutocompleteRequest();
+  editor.handleInput("down");
+  assert.equal(focused, undefined);
+  release();
+  await request;
+  editor.handleInput("down");
+  assert.notEqual(focused, undefined, "handoff resumes after queued completion work settles");
+});
+
+test("rejected autocomplete requests release fleet handoff", async () => {
+  let focused: unknown;
+  const editor = {
+    autocompleteAbort: {},
+    getText: () => "@file",
+    getCursor: () => ({ line: 0, col: 5 }),
+    isShowingAutocomplete: () => false,
+    async startAutocompleteRequest() { throw new Error("provider failed"); },
+    handleInput(_data: string) {},
+  };
+  attachFleetEditorNavigation(
+    editor,
+    { setFocus(component: unknown) { focused = component; } },
+    { matches: (_data: string, action: string) => action === "tui.editor.cursorDown" },
+    { hasRows: () => true },
+  );
+
+  await assert.rejects(editor.startAutocompleteRequest(), /provider failed/);
+  editor.handleInput("down");
+  assert.notEqual(focused, undefined, "stale native abort state cannot permanently block navigation");
+});
+
+test("fleet Up returns to the editor and Enter inspects the selected child", async () => {
+  let focused: unknown;
+  const inspected: string[] = [];
+  const editor = {};
+  const tui = { setFocus(component: unknown) { focused = component; }, requestRender() {} } as any;
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+  const widget = new FleetWidget(tui, theme, () => [
+    view({ id: "one", title: "one" }),
+    view({ id: "two", title: "two" }),
+  ], async (id) => { inspected.push(id); });
+  widget.setEditor(editor as any);
+  widget.focused = true;
+
+  widget.handleInput("\x1b[B");
+  assert.ok(widget.render(100)[1].startsWith("› "), "Down selects the next fleet row");
+  widget.handleInput("\r");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(inspected, ["two"]);
+  widget.handleInput("\x1b[A");
+  widget.handleInput("\x1b[A");
+  assert.equal(focused, editor, "Up above the first row restores editor focus");
+});
+
+test("fleet navigation honors configured editor/select keybindings", () => {
+  let focused: unknown;
+  const editor = {};
+  const tui = { setFocus(component: unknown) { focused = component; }, requestRender() {} } as any;
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+  const widget = new FleetWidget(
+    tui,
+    theme,
+    () => [view({ id: "one" }), view({ id: "two" })],
+    async () => {},
+  );
+  widget.setEditor(editor as any, {
+    matches: (data, action) =>
+      (data === "j" && action === "tui.select.down") ||
+      (data === "k" && action === "tui.select.up"),
+  });
+  widget.focused = true;
+
+  widget.handleInput("j");
+  assert.ok(widget.render(80)[1].startsWith("› "));
+  widget.handleInput("k");
+  widget.handleInput("k");
+  assert.equal(focused, editor);
+});
+
+test("extension installs focus navigation without a raw terminal listener", async () => {
+  const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+  let terminalInputListeners = 0;
+  let editorFactories = 0;
+  let previousFactoryCalls = 0;
+  let installedEditor: unknown;
+  let statusUpdates = 0;
+  const previousEditor = {
+    render: () => [],
+    handleInput(_data: string) {},
+    getText: () => "",
+    setText(_text: string) {},
+    getCursor: () => ({ line: 0, col: 0 }),
+  };
+  const previousHandleInput = previousEditor.handleInput;
+  const pi = {
+    on(event: string, handler: (...args: any[]) => unknown) {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
+    registerTool() {},
+    registerCommand() {},
+    appendEntry() {},
+    sendUserMessage() {},
+  } as any;
+  subagentsExtension(pi);
+  const ctx = {
+    mode: "tui",
+    ui: {
+      setWidget(_id: string, content: unknown) {
+        if (typeof content === "function") {
+          content(
+            { setFocus() {}, requestRender() {} },
+            { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+          );
+        }
+      },
+      setStatus() { statusUpdates += 1; },
+      notify() {},
+      getEditorComponent() {
+        return () => {
+          previousFactoryCalls += 1;
+          return previousEditor;
+        };
+      },
+      setEditorComponent(factory: (...args: any[]) => unknown) {
+        editorFactories += 1;
+        installedEditor = factory(
+          { setFocus() {}, requestRender() {} },
+          { borderColor: (text: string) => text, selectList: {} },
+          { matches: () => false },
+        );
+      },
+      onTerminalInput() {
+        terminalInputListeners += 1;
+        return () => {};
+      },
+    },
+  };
+
+  for (const handler of [...(handlers.get("session_start") ?? [])]) await handler({}, ctx);
+  assert.equal(terminalInputListeners, 0, "focused questions and dialogs retain Enter and arrow keys");
+  assert.equal(editorFactories, 1, "the editor owns the Down handoff instead");
+  assert.equal(previousFactoryCalls, 1, "an existing custom editor factory is preserved");
+  assert.equal(installedEditor, previousEditor, "the existing custom editor instance is retained");
+  assert.equal(previousEditor.handleInput, previousHandleInput, "an arbitrary custom editor's Down handling is not overridden");
+
+  ring.upsert("cleanup-test", { title: "cleanup", status: "working" });
+  const updatesBeforeShutdown = statusUpdates;
+  for (const handler of [...(handlers.get("session_shutdown") ?? [])]) await handler({}, ctx);
+  await new Promise<void>((resolve) => setTimeout(resolve, 300));
+  assert.equal(statusUpdates, updatesBeforeShutdown, "queued renders are cancelled before session context becomes stale");
+  ring.reset();
+});
+
+test("fleet overlay stays active through a selected child inspection", async () => {
   let customCalls = 0;
   let closeInspect!: () => void;
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
@@ -226,17 +467,17 @@ test("fleet overlay stays active through a selected child so global Enter captur
   const entries = [msg("entry", "assistant", "child report")];
   const loadedIds: string[] = [];
 
-  let globalEnterGuardActive = true;
+  let fleetOverlayActive = true;
   const fleet = openFleetOverlay(ctx, views, (id) => {
     loadedIds.push(id);
     return entries;
-  }).finally(() => { globalEnterGuardActive = false; });
+  }).finally(() => { fleetOverlayActive = false; });
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(customCalls, 2, "selection opened the child conversation");
   assert.deepEqual(loadedIds, ["one"], "selected child identity reaches the inspect overlay");
-  assert.equal(globalEnterGuardActive, true, "guard remains active while child overlay is visible");
+  assert.equal(fleetOverlayActive, true, "fleet interaction remains active while child overlay is visible");
   closeInspect();
   await fleet;
-  assert.equal(globalEnterGuardActive, false);
+  assert.equal(fleetOverlayActive, false);
 });

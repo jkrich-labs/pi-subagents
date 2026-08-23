@@ -18,6 +18,24 @@ export interface RpcChildOptions {
   systemPrompt?: string;
 }
 
+export function buildChildArgs(opts: RpcChildOptions): string[] {
+  const args = [
+    "--mode", "rpc",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+  ];
+  if (opts.sessionDir) args.push("--session-dir", opts.sessionDir);
+  if (opts.sessionName) args.push("--name", opts.sessionName);
+  if (opts.provider) args.push("--provider", opts.provider);
+  if (opts.model) args.push("--model", opts.model);
+  if (opts.thinking) args.push("--thinking", opts.thinking);
+  if (opts.systemPrompt) args.push("--append-system-prompt", opts.systemPrompt);
+  return args;
+}
+
 export interface RpcChildHandle {
   readonly proc: { readonly pid?: number };
   readonly lines: WireLine[];
@@ -66,23 +84,7 @@ export class RpcChild implements RpcChildHandle {
   }
 
   static async spawnChild(opts: RpcChildOptions): Promise<RpcChild> {
-    const args = [
-      "--mode", "rpc",
-      "--no-tools",
-      "--no-extensions",
-      "--no-skills",
-      "--no-prompt-templates",
-      "--no-themes",
-      "--no-context-files",
-    ];
-    if (opts.sessionDir) args.push("--session-dir", opts.sessionDir);
-    if (opts.sessionName) args.push("--name", opts.sessionName);
-    if (opts.provider) args.push("--provider", opts.provider);
-    if (opts.model) args.push("--model", opts.model);
-    if (opts.thinking) args.push("--thinking", opts.thinking);
-    if (opts.systemPrompt) args.push("--append-system-prompt", opts.systemPrompt);
-
-    const proc = spawn("pi", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const proc = spawn("pi", buildChildArgs(opts), { stdio: ["pipe", "pipe", "pipe"] });
     const child = new RpcChild(proc);
     child.captureStderr();
     const ok = await child.send("get_state", {}, 8000);

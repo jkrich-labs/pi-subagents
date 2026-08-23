@@ -34,9 +34,11 @@
     "extensions/subagents/liveness/orphan-reaper.ts",
     "extensions/subagents/liveness/engine.ts",
     "extensions/subagents/ui/ticker.ts",
+    "extensions/subagents/ui/focus.ts",
     "extensions/subagents/ui/inspect.ts",
     "extensions/subagents/ui/overlay.ts",
     "tests/liveness.test.ts",
+    "tests/child.test.ts",
     "tests/ui.test.ts",
     "tests/agents.test.ts"
   ]

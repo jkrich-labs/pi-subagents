@@ -164,7 +164,7 @@ export async function openNavigateOverlay(
 }
 
 /**
- * Fleet picker (busy-stream enter target): one child goes straight to its
+ * Fleet picker: one child goes straight to its
  * conversation; several show a SelectList first.
  */
 export async function openFleetOverlay(

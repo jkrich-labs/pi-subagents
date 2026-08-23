@@ -4,7 +4,7 @@
 Checks (evidence logged, grep-able):
   1. /subagent spawn → child spawns, ticker widget renders in TUI output
   2. ticker line contains status + model::thinking + turn count
-  3. busy-stream enter opens the fleet/inspect overlay ("entry 1/" appears)
+  3. editor Down focuses the fleet and Enter opens inspection ("entry 1/" appears)
   4. /subagent list notifies
 
 Not part of CI — this is the S-05 visual smoke substitute (work.md preflight).
@@ -81,15 +81,13 @@ try:
     wait_for(r"smoke:.*(done|last\+)", 120)
     check("ticker shows completion state", re.search(r"smoke:.*(done|last\+)", buf.decode("utf-8","replace")) is not None)
 
-    # 5. busy-stream enter opens the overlay: make parent stream a LONG time, then Enter
-    send("List 500 animals, one per line, numbered, no tools\r")
-    time.sleep(1.5)  # parent should be well into streaming now
+    # 5. Down at the editor boundary focuses the fleet; Enter inspects the row.
+    send("\x1b[B")
     send("\r")
-    overlay = wait_for(r"entry 1/\d+|Navigate smoke|Subagents", 20)
-    check("busy-stream enter opens overlay", overlay)
-    send("\x1b")  # esc closes overlay
-    pump(2)
-    send("\x1b")  # esc aborts parent stream
+    overlay = wait_for(r"entry 1/\d+", 20)
+    check("editor Down + fleet Enter opens child inspection", overlay)
+    send("\x1b")  # esc closes inspection back to the fleet
+    send("\x1b[A")  # up from the first fleet row restores editor focus
     pump(2)
 
     # 6. /subagent list notifies
