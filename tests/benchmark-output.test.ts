@@ -55,8 +55,8 @@ function sample(input: {
     wallTimeMs: input.wallTimeMs,
     accounting: { usage: usage(input.totalTokens), toolFailures: input.toolFailures, diagnostics: [], diagnosticsDropped: 0 },
     launchTrace: ["diagnosis", "implementation", "review"].flatMap((id): BenchmarkLaunchTrace[] => [
-      { scenarioId: id, participant: "parent", id: `${id}-parent`, pid: 101, startedAt: 1, ...manifest.parent },
-      { scenarioId: id, participant: "child", id: `${id}-child`, pid: 102, startedAt: 1, ...manifest.child },
+      { scenarioId: id, participant: "parent", id: `${id}-parent`, pid: 101, startedAt: 1, completed: true, failed: false, ...manifest.parent },
+      { scenarioId: id, participant: "child", id: `${id}-child`, pid: 102, startedAt: 1, completed: true, failed: false, ...manifest.child },
     ]),
     scenarios: ["diagnosis", "implementation", "review"].map((id) => ({
       id,

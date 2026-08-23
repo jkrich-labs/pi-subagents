@@ -622,6 +622,8 @@ export async function runScenario(
         id: "parent",
         pid: parent?.pid ?? -1,
         startedAt: kpiStartedAt,
+        completed: terminalReached && !timeout && !cancelled,
+        failed: timeout || cancelled,
         ...contract.parentPolicy,
       },
       ...[...lifetimes.values()].map((child) => ({
@@ -630,6 +632,8 @@ export async function runScenario(
         id: child.id,
         pid: child.pid,
         startedAt: child.startedAt,
+        completed: evidence?.completedChildReports === evidence?.requiredChildCount && evidence?.requiredChildCount !== 0,
+        failed: evidence?.childFailure ?? false,
         ...contract.childPolicy,
       })),
     ],

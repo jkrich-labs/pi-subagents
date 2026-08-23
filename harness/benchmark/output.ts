@@ -199,8 +199,8 @@ function launchTraceForManifest(manifest: BenchmarkSuiteManifest): BenchmarkLaun
     const id = typeof scenario === "object" && scenario !== null ? (scenario as Record<string, unknown>).id : undefined;
     if (typeof id !== "string") return [];
     return [
-      { scenarioId: id, participant: "parent" as const, id: `${id}:parent`, pid: -1, startedAt: 0, ...manifest.parent },
-      { scenarioId: id, participant: "child" as const, id: `${id}:child`, pid: -1, startedAt: 0, ...manifest.child },
+      { scenarioId: id, participant: "parent" as const, id: `${id}:parent`, pid: -1, startedAt: 0, completed: false, failed: false, ...manifest.parent },
+      { scenarioId: id, participant: "child" as const, id: `${id}:child`, pid: -1, startedAt: 0, completed: false, failed: false, ...manifest.child },
     ];
   });
 }
@@ -210,7 +210,8 @@ function launchTraceMatchesManifest(trace: readonly BenchmarkLaunchTrace[], mani
   return trace.length > 0 && trace.every((entry) => {
     const expected = scenarios.find((candidate) => candidate.scenarioId === entry.scenarioId && candidate.participant === entry.participant);
     return expected !== undefined && entry.provider === expected.provider && entry.model === expected.model && entry.thinking === expected.thinking &&
-      typeof entry.id === "string" && entry.id !== "" && Number.isInteger(entry.pid) && entry.pid > 0 && Number.isFinite(entry.startedAt) && entry.startedAt > 0;
+      typeof entry.id === "string" && entry.id !== "" && Number.isInteger(entry.pid) && entry.pid > 0 && Number.isFinite(entry.startedAt) && entry.startedAt > 0 &&
+      typeof entry.completed === "boolean" && typeof entry.failed === "boolean";
   }) && scenarios.every((expected) => trace.some((entry) => entry.scenarioId === expected.scenarioId && entry.participant === expected.participant));
 }
 

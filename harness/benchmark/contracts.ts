@@ -15,6 +15,8 @@ export interface BenchmarkLaunchTrace {
   provider: string;
   model: string;
   thinking: string;
+  completed: boolean;
+  failed: boolean;
 }
 
 /** The exact model configuration one benchmark participant is allowed to use. */

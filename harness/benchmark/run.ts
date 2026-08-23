@@ -402,6 +402,8 @@ async function runSmoke(): Promise<SmokeArtifact> {
         id: "parent",
         pid: parentPid ?? -1,
         startedAt,
+        completed: terminalReached,
+        failed: !terminalReached,
         ...AUTONOMOUS_SMOKE_MANIFEST.parent,
       },
       ...(spawnedChildId ? [{
@@ -410,6 +412,8 @@ async function runSmoke(): Promise<SmokeArtifact> {
         id: spawnedChildId,
         pid: capturedChildPids[0] ?? -1,
         startedAt,
+        completed: childReportDelivered,
+        failed: !childReportDelivered,
         ...AUTONOMOUS_SMOKE_MANIFEST.child,
       }] : []),
     ],
