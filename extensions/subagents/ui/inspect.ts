@@ -147,3 +147,33 @@ export function shouldConsumeEnter(data: string, parentBusy: boolean, childCount
   if (!parentBusy || childCount === 0) return false;
   return data === "\r" || data === "\n" || data === "\r\n";
 }
+
+export interface BusyStreamEnterOptions {
+  isParentBusy: () => boolean;
+  childCount: () => number;
+  openOverlay: () => Promise<void>;
+  onError: (error: unknown) => void;
+}
+
+/**
+ * Own the global busy-stream Enter lifecycle. While the overlay promise is
+ * active, input passes through to that overlay instead of opening another one
+ * behind it.
+ */
+export function createBusyStreamEnterHandler(options: BusyStreamEnterOptions) {
+  let overlayOpen = false;
+  return (data: string): { consume: true } | undefined => {
+    if (overlayOpen) return undefined;
+    if (!shouldConsumeEnter(data, options.isParentBusy(), options.childCount())) return undefined;
+    overlayOpen = true;
+    try {
+      void options.openOverlay()
+        .catch(options.onError)
+        .finally(() => { overlayOpen = false; });
+    } catch (error) {
+      overlayOpen = false;
+      options.onError(error);
+    }
+    return { consume: true };
+  };
+}

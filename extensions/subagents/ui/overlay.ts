@@ -194,17 +194,13 @@ export async function openFleetOverlay(
     label: `${v.id.slice(0, 8)} ${v.title}`,
     description: `${v.status} • ${v.model ?? "?"}::${v.thinking ?? "?"} • t${v.turnCount}`,
   }));
-  await ctx.ui.custom<null>(
+  const selectedId = await ctx.ui.custom<string | null>(
     (tui, theme, _kb, done) => {
       const container = new Container();
       container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
       container.addChild(new Text(theme.fg("accent", theme.bold("Subagents")), 1, 0));
       const list = new SelectList(items, Math.min(items.length, 10), getSelectListTheme());
-      list.onSelect = (item) => {
-        done(null);
-        const v = live.find((x) => x.id === item.value);
-        if (v) void open(v);
-      };
+      list.onSelect = (item) => done(item.value);
       list.onCancel = () => done(null);
       container.addChild(list);
       container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter inspect • esc cancel"), 1, 0));
@@ -220,4 +216,6 @@ export async function openFleetOverlay(
     },
     { overlay: true, overlayOptions: { width: "60%", maxHeight: "50%", anchor: "center" } },
   );
+  const selected = selectedId ? live.find((view) => view.id === selectedId) : undefined;
+  if (selected) await open(selected);
 }

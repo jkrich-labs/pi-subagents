@@ -12,7 +12,7 @@ import { LivenessEngine } from "./liveness/engine.ts";
 import { ring } from "./ring/store.ts";
 import { routeSteers, stripSteers } from "./route.ts";
 import { renderTicker } from "./ui/ticker.ts";
-import { shouldConsumeEnter, type SessionEntryLike } from "./ui/inspect.ts";
+import { createBusyStreamEnterHandler, type SessionEntryLike } from "./ui/inspect.ts";
 import { openFleetOverlay, openInspectOverlay, openNavigateOverlay } from "./ui/overlay.ts";
 import { readFileSync } from "node:fs";
 
@@ -174,20 +174,15 @@ export default function (pi: ExtensionAPI) {
       if (ring.list().length > 0) render();
     }, 1000);
     // Busy-stream enter: while the parent streams, enter opens the fleet
-    // overlay instead of queuing editor text. Guarded against re-entry so
-    // enter inside the open overlay reaches the overlay itself.
-    let overlayOpen = false;
-    const unsubInput = ctx.ui.onTerminalInput((data) => {
-      if (overlayOpen) return undefined;
-      if (!shouldConsumeEnter(data, parentBusy, ring.list().length)) return undefined;
-      overlayOpen = true;
-      void openFleetOverlay(ctx, ring.list(), (id) => loadEntriesFromFile(ring.get(id)?.sessionFile))
-        .catch(() => ctx.ui.notify("overlay failed to open", "warning"))
-        .finally(() => {
-          overlayOpen = false;
-        });
-      return { consume: true };
+    // overlay instead of queuing editor text. The handler owns the full nested
+    // overlay promise so Enter inside a visible overlay is never recaptured.
+    const handleBusyStreamEnter = createBusyStreamEnterHandler({
+      isParentBusy: () => parentBusy,
+      childCount: () => ring.list().length,
+      openOverlay: () => openFleetOverlay(ctx, ring.list(), (id) => loadEntriesFromFile(ring.get(id)?.sessionFile)),
+      onError: () => ctx.ui.notify("overlay failed to open", "warning"),
     });
+    const unsubInput = ctx.ui.onTerminalInput(handleBusyStreamEnter);
     render();
     pi.on("session_shutdown", () => {
       clearInterval(tick);

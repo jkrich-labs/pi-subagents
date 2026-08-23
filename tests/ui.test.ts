@@ -13,10 +13,12 @@ import {
   segmentOf,
   segmentMarkdown,
   Pager,
+  createBusyStreamEnterHandler,
   shouldConsumeEnter,
   type SessionEntryLike,
 } from "../extensions/subagents/ui/inspect.ts";
 import { blankView, type ChildView } from "../extensions/subagents/ring/store.ts";
+import { openFleetOverlay } from "../extensions/subagents/ui/overlay.ts";
 
 function view(patch: Partial<ChildView>): ChildView {
   return { ...blankView(), id: "abc123def456", title: "demo", ...patch };
@@ -171,4 +173,70 @@ test("shouldConsumeEnter: only busy + enter + children", () => {
   assert.equal(shouldConsumeEnter("\r", true, 0), false, "no children → nothing to open");
   assert.equal(shouldConsumeEnter("x", true, 2), false, "other keys pass through");
   assert.equal(shouldConsumeEnter("\r\n", true, 1), true, "CRLF enter accepted");
+});
+
+test("busy-stream Enter handler ignores Enter while its overlay promise is active", async () => {
+  let opens = 0;
+  let closeOverlay!: () => void;
+  const handler = createBusyStreamEnterHandler({
+    isParentBusy: () => true,
+    childCount: () => 2,
+    openOverlay: () => {
+      opens += 1;
+      return new Promise<void>((resolve) => { closeOverlay = resolve; });
+    },
+    onError() {},
+  });
+
+  assert.deepEqual(handler("\r"), { consume: true });
+  assert.equal(opens, 1);
+  assert.equal(handler("\r"), undefined, "visible overlay owns Enter; global handler passes it through");
+  assert.equal(opens, 1, "a second overlay was not opened behind the first");
+
+  closeOverlay();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(handler("\r"), { consume: true }, "handler reactivates only after the overlay closes");
+  assert.equal(opens, 2);
+  closeOverlay();
+});
+
+test("fleet overlay stays active through a selected child so global Enter capture cannot reactivate", async () => {
+  let customCalls = 0;
+  let closeInspect!: () => void;
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const ctx = {
+    ui: {
+      notify() {},
+      custom(factory: (...args: any[]) => any) {
+        customCalls += 1;
+        if (customCalls === 2) {
+          return new Promise<null>((resolve) => { closeInspect = () => resolve(null); });
+        }
+        return new Promise<null>((resolve) => {
+          const component = factory({ requestRender() {} }, theme, {}, resolve);
+          component.handleInput("\r");
+        });
+      },
+    },
+  } as unknown as Parameters<typeof openFleetOverlay>[0];
+  const views = [
+    view({ id: "one", title: "one", status: "working" }),
+    view({ id: "two", title: "two", status: "working" }),
+  ];
+  const entries = [msg("entry", "assistant", "child report")];
+  const loadedIds: string[] = [];
+
+  let globalEnterGuardActive = true;
+  const fleet = openFleetOverlay(ctx, views, (id) => {
+    loadedIds.push(id);
+    return entries;
+  }).finally(() => { globalEnterGuardActive = false; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(customCalls, 2, "selection opened the child conversation");
+  assert.deepEqual(loadedIds, ["one"], "selected child identity reaches the inspect overlay");
+  assert.equal(globalEnterGuardActive, true, "guard remains active while child overlay is visible");
+  closeInspect();
+  await fleet;
+  assert.equal(globalEnterGuardActive, false);
 });
