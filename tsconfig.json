@@ -18,6 +18,7 @@
     "tests/rpc-child-harness.test.ts",
     "extensions/subagents/ground.ts",
     "extensions/subagents/child.ts",
+    "extensions/subagents/agents.ts",
     "extensions/subagents/ring/store.ts",
     "extensions/subagents/route.ts",
     "extensions/subagents/tokens.ts",
@@ -36,6 +37,7 @@
     "extensions/subagents/ui/inspect.ts",
     "extensions/subagents/ui/overlay.ts",
     "tests/liveness.test.ts",
-    "tests/ui.test.ts"
+    "tests/ui.test.ts",
+    "tests/agents.test.ts"
   ]
 }
