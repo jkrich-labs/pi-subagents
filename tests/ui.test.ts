@@ -562,14 +562,12 @@ test("parent bash guard blocks raw delegation, polling, and hub-owned kills", ()
   assert.equal(parentBashGuard("sleep 1; npm test", true, () => false), undefined, "a test command containing sleep is not polling");
   assert.deepEqual(parentBashGuard("sleep 20; ps -ef", false, () => false), {
     block: true,
-    reason: "Do not poll background work with shell sleeps or PID checks. Delegate through Task/spawn_subagent and end this turn.",
-    terminate: true,
-  }, "polling is blocked even when work bypassed the hub");
+    reason: "Do not poll background work with shell sleeps or PID checks. Delegate through Task/spawn_subagent instead.",
+  }, "polling without a hub child stays recoverable because nothing can wake a terminated parent");
   assert.deepEqual(parentBashGuard("(cd /tmp/wt && pi -p --no-session --model gpt-5.6-sol 'fix') > report 2>&1 & echo $! > child-pid", false, () => false), {
     block: true,
     reason: "Do not launch nested pi agents through bash or manage their PID files. Use Task/spawn_subagent with cwd instead.",
-    terminate: true,
-  });
+  }, "a blocked raw launch returns control so the parent can delegate correctly");
   assert.equal(parentBashGuard("pi --list-models", false, () => false), undefined, "non-agent pi diagnostics remain available");
 });
 

@@ -24,12 +24,13 @@ const CHILD_KILL_BLOCK_REASON =
 const RAW_PI_BLOCK_REASON =
   "Do not launch nested pi agents through bash or manage their PID files. Use Task/spawn_subagent with cwd instead.";
 const RAW_POLLING_BLOCK_REASON =
-  "Do not poll background work with shell sleeps or PID checks. Delegate through Task/spawn_subagent and end this turn.";
+  "Do not poll background work with shell sleeps or PID checks. Delegate through Task/spawn_subagent instead.";
 
 export interface ParentBashGuardDecision {
   block: true;
   reason: string;
-  terminate: true;
+  /** End only when a live hub child can wake the parent with a later event. */
+  terminate?: true;
 }
 
 export interface SpawnToolResult {
@@ -71,17 +72,15 @@ export function parentBashGuard(
   ownsProcess: (pid: number) => boolean,
 ): ParentBashGuardDecision | undefined {
   if (launchesNestedPi(command)) {
-    return { block: true, reason: RAW_PI_BLOCK_REASON, terminate: true };
+    return { block: true, reason: RAW_PI_BLOCK_REASON };
   }
   if (killTargets(command).some(ownsProcess)) {
     return { block: true, reason: CHILD_KILL_BLOCK_REASON, terminate: true };
   }
   if (isPollingSleep(command)) {
-    return {
-      block: true,
-      reason: hasActiveChildren ? POLLING_BLOCK_REASON : RAW_POLLING_BLOCK_REASON,
-      terminate: true,
-    };
+    return hasActiveChildren
+      ? { block: true, reason: POLLING_BLOCK_REASON, terminate: true }
+      : { block: true, reason: RAW_POLLING_BLOCK_REASON };
   }
   return undefined;
 }
