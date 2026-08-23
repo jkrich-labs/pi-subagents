@@ -32,6 +32,10 @@
     "liveness/tombstones.ts",
     "liveness/orphan-reaper.ts",
     "liveness/engine.ts",
-    "tests/liveness.test.ts"
+    "ui/ticker.ts",
+    "ui/inspect.ts",
+    "ui/overlay.ts",
+    "tests/liveness.test.ts",
+    "tests/ui.test.ts"
   ]
 }

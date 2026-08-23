@@ -11,6 +11,10 @@ import { Hub, type Delivery, type SpawnRequest } from "./hub.ts";
 import { LivenessEngine } from "../../liveness/engine.ts";
 import { ring } from "./ring/store.ts";
 import { routeSteers, stripSteers } from "./route.ts";
+import { renderTicker } from "../../ui/ticker.ts";
+import { shouldConsumeEnter, type SessionEntryLike } from "../../ui/inspect.ts";
+import { openFleetOverlay, openInspectOverlay, openNavigateOverlay } from "../../ui/overlay.ts";
+import { readFileSync } from "node:fs";
 
 function extractText(msg: Record<string, unknown>): string {
   const content = msg.content as Array<Record<string, unknown>> | undefined;
@@ -132,22 +136,95 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Live ticker placeholder — S-05 renders ring state. Keep a stable key
-  // so the footer/status slot exists from this slice on.
+  // --- S-05 TUI wiring: live ticker + footer status + busy-stream enter ---
+  let parentBusy = false;
+  pi.on("agent_start", () => {
+    parentBusy = true;
+  });
+  pi.on("agent_end", () => {
+    parentBusy = false;
+  });
+  pi.on("agent_settled", () => {
+    parentBusy = false;
+  });
+
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.mode === "tui") {
-      const kids = ring.list().length;
-      ctx.ui.setStatus("subagents", kids > 0 ? `subagents: ${kids}` : undefined);
-    }
+    if (ctx.mode !== "tui") return;
+    let scheduled = false;
+    const render = (): void => {
+      const kids = ring.list();
+      const lines = renderTicker(kids);
+      ctx.ui.setWidget("subagents", lines.length > 0 ? lines : undefined);
+      const active = kids.filter((k) => k.status === "working" || k.status === "asking").length;
+      ctx.ui.setStatus("subagents", kids.length > 0 ? `subagents: ${active}/${kids.length}` : undefined);
+    };
+    // Ring events throttle to ≤1 render per 250ms; a 1s freshness tick keeps
+    // elapsed fields moving while children exist (never blocks the parent).
+    const throttled = (): void => {
+      if (scheduled) return;
+      scheduled = true;
+      setTimeout(() => {
+        scheduled = false;
+        render();
+      }, 250);
+    };
+    ring.on("update", throttled);
+    ring.on("remove", throttled);
+    const tick = setInterval(() => {
+      if (ring.list().length > 0) render();
+    }, 1000);
+    // Busy-stream enter: while the parent streams, enter opens the fleet
+    // overlay instead of queuing editor text. Guarded against re-entry so
+    // enter inside the open overlay reaches the overlay itself.
+    let overlayOpen = false;
+    const unsubInput = ctx.ui.onTerminalInput((data) => {
+      if (overlayOpen) return undefined;
+      if (!shouldConsumeEnter(data, parentBusy, ring.list().length)) return undefined;
+      overlayOpen = true;
+      void openFleetOverlay(ctx, ring.list(), (id) => loadEntriesFromFile(ring.get(id)?.sessionFile))
+        .catch(() => ctx.ui.notify("overlay failed to open", "warning"))
+        .finally(() => {
+          overlayOpen = false;
+        });
+      return { consume: true };
+    });
+    render();
+    pi.on("session_shutdown", () => {
+      clearInterval(tick);
+      ring.off("update", throttled);
+      ring.off("remove", throttled);
+      unsubInput();
+    });
   });
 
   // `/subagent` user command.
   pi.registerCommand("subagent", {
-    description: "Manage the subagent fleet: spawn|list|steer|kill|resume|inspect",
+    description: "Manage the subagent fleet: spawn|list|steer|kill|resume|inspect|navigate",
     handler: async (args, ctx) => {
       await subagentCommand(pi, hub, ctx, args);
     },
   });
+}
+
+/** Read a child's session file (JSONL) into renderable entries. */
+function loadEntriesFromFile(sessionFile: string | undefined): SessionEntryLike[] | null {
+  if (!sessionFile) return null;
+  try {
+    const raw = readFileSync(sessionFile, "utf8");
+    const out: SessionEntryLike[] = [];
+    for (const line of raw.split("\n")) {
+      const t = line.trim();
+      if (t.length === 0) continue;
+      try {
+        out.push(JSON.parse(t) as SessionEntryLike);
+      } catch {
+        /* tolerate a partial tail line on a live file */
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
 }
 
 function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
@@ -214,11 +291,38 @@ async function subagentCommand(pi: ExtensionAPI, hub: Hub, ctx: ExtensionCommand
         ctx.ui.notify(`unknown child ${rest[0]}`, "warning");
         return;
       }
-      ctx.ui.notify(`${v.id}: ${v.status} session ${v.sessionFile ?? "?"}`, "info");
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify(`${v.id}: ${v.status} session ${v.sessionFile ?? "?"}`, "info");
+        return;
+      }
+      const entries = loadEntriesFromFile(v.sessionFile);
+      if (!entries) {
+        ctx.ui.notify(`${v.id}: no session file to inspect`, "warning");
+        return;
+      }
+      await openInspectOverlay(ctx, v, entries);
+      return;
+    }
+    case "navigate": {
+      const v = ring.get(rest[0]);
+      if (!v) {
+        ctx.ui.notify(`unknown child ${rest[0]}`, "warning");
+        return;
+      }
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("navigate requires the TUI", "warning");
+        return;
+      }
+      const entries = loadEntriesFromFile(v.sessionFile);
+      if (!entries) {
+        ctx.ui.notify(`${v.id}: no session file to navigate`, "warning");
+        return;
+      }
+      await openNavigateOverlay(ctx, v, entries);
       return;
     }
     default:
-      ctx.ui.notify("/subagent spawn|list|steer|kill|resume|inspect", "warning");
+      ctx.ui.notify("/subagent spawn|list|steer|kill|resume|inspect|navigate", "warning");
       return;
   }
 }
