@@ -136,6 +136,8 @@ export interface ScenarioEvidence {
   requiredChildCount: number;
   /** Required roles resolve to distinct persisted child identities. */
   distinctRequiredChildren: boolean;
+  /** Child session evidence proves the assigned child did delegated work. */
+  delegatedWork: boolean;
   /** Number of child reports that ended in DONE-PARENT. */
   completedChildReports: number;
   /** Every required child report was persisted before the parent terminal marker. */
@@ -292,6 +294,7 @@ function noEvidence(): ScenarioEvidence {
     modelPolicyPassed: false,
     requiredChildCount: 0,
     distinctRequiredChildren: false,
+    delegatedWork: false,
     completedChildReports: 0,
     childReportsBeforeTerminal: false,
     integrationAfterReports: false,
@@ -360,6 +363,7 @@ function gatesFor(
     { id: "no-runner-continuation", passed: result.initialPromptCount === 1, detail: "one initial parent prompt only" },
     { id: "minimum-child-count", passed: evidence.requiredChildCount >= contract.minimumChildren },
     { id: "distinct-required-child-identities", passed: evidence.distinctRequiredChildren },
+    { id: "delegated-child-work", passed: evidence.delegatedWork },
     { id: "child-lifetime-overlap", passed: evidence.requiredOverlap },
     ...(evidence.workflowGates ?? []),
     ...contract.expectedRoles.map((role) => ({

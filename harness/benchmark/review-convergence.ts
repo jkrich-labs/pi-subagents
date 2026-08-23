@@ -11,6 +11,7 @@ import {
   childDoneAt,
   childHasDoneReport,
   childHasFailure,
+  childHasToolCall,
   childSessionsOverlap,
   parentTerminalAt,
   reviewIntegrationOrdering,
@@ -187,6 +188,7 @@ function scenarioContract(port: RealRunnerPort): ScenarioContract {
         modelPolicyPassed,
         requiredChildCount: requiredChildren.length,
         distinctRequiredChildren: new Set(required.map((item) => item.spawn?.childId).filter((id): id is string => id !== undefined)).size === REVIEW_CONVERGENCE_REQUIREMENTS.expectedRoles.length,
+        delegatedWork: required.filter((item) => item.role.title !== "redaction-implementer").every((item) => item.child !== undefined && childHasToolCall(item.child.session.jsonl, ["read", "bash", "grep"])),
         completedChildReports: requiredChildren.filter((session) => childHasDoneReport(session.jsonl)).length,
         childReportsBeforeTerminal,
         integrationAfterReports: parent ? reviewIntegrationOrdering(
@@ -282,7 +284,11 @@ export async function runReviewConvergence(): Promise<ReviewConvergenceArtifact>
   const sample = createBenchmarkSample({
     manifest: REVIEW_CONVERGENCE_MANIFEST,
     wallTimeMs: result.wallTimeMs,
-    accounting,
+    accounting: {
+      ...accounting,
+      diagnostics: [...accounting.diagnostics, ...result.diagnostics.map((diagnostic) => ({ code: diagnostic.code, message: diagnostic.message }))],
+      diagnosticsDropped: accounting.diagnosticsDropped + result.diagnosticsDropped,
+    },
     launchTrace: result.launchTrace,
     scenarios: [{
       id: REVIEW_CONVERGENCE_SCENARIO_ID,

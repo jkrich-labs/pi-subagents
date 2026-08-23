@@ -11,6 +11,7 @@ import {
   childDoneAt,
   childHasDoneReport,
   childHasFailure,
+  childHasToolCall,
   childSessionsOverlap,
   integrationAfterReports,
   parentTerminalAt,
@@ -157,6 +158,7 @@ function scenarioContract(port: RealRunnerPort): ScenarioContract {
         modelPolicyPassed,
         requiredChildCount: requiredChildren.length,
         distinctRequiredChildren: new Set(required.map((item) => item.spawn?.childId).filter((id): id is string => id !== undefined)).size === PARALLEL_IMPLEMENTATION_REQUIREMENTS.expectedRoles.length,
+        delegatedWork: requiredChildren.length === PARALLEL_IMPLEMENTATION_REQUIREMENTS.expectedRoles.length && requiredChildren.every((child) => childHasToolCall(child.jsonl, ["edit", "write", "bash"])),
         completedChildReports: requiredChildren.filter((session) => childHasDoneReport(session.jsonl)).length,
         childReportsBeforeTerminal,
         integrationAfterReports: parent ? integrationAfterReports(
@@ -254,7 +256,11 @@ export async function runParallelImplementation(): Promise<ParallelImplementatio
   const sample = createBenchmarkSample({
     manifest: PARALLEL_IMPLEMENTATION_MANIFEST,
     wallTimeMs: result.wallTimeMs,
-    accounting,
+    accounting: {
+      ...accounting,
+      diagnostics: [...accounting.diagnostics, ...result.diagnostics.map((diagnostic) => ({ code: diagnostic.code, message: diagnostic.message }))],
+      diagnosticsDropped: accounting.diagnosticsDropped + result.diagnosticsDropped,
+    },
     launchTrace: result.launchTrace,
     scenarios: [{
       id: PARALLEL_IMPLEMENTATION_SCENARIO_ID,

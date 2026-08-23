@@ -627,6 +627,23 @@ function assistantText(message: unknown): string {
     .join("\n");
 }
 
+export function childHasToolCall(jsonl: string, names: readonly string[]): boolean {
+  for (const raw of jsonl.split(/\r?\n/)) {
+    try {
+      const entry = asRecord(JSON.parse(raw));
+      const message = entry && asRecord(entry.message);
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+      if (message.content.some((part) => {
+        const record = asRecord(part);
+        return record?.type === "toolCall" && typeof record.name === "string" && names.includes(record.name);
+      })) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
 export function childHasDoneReport(jsonl: string): boolean {
   for (const raw of jsonl.split(/\r?\n/)) {
     try {
@@ -770,6 +787,7 @@ function scenarioContract(port: RealRunnerPort): ScenarioContract {
         modelPolicyPassed,
         requiredChildCount: requiredChildren.length,
         distinctRequiredChildren: new Set(requiredSpawns.map((spawn) => spawn?.childId).filter((id): id is string => id !== undefined)).size === PARALLEL_DIAGNOSIS_REQUIREMENTS.expectedRoles.length,
+        delegatedWork: requiredChildren.length === PARALLEL_DIAGNOSIS_REQUIREMENTS.expectedRoles.length && requiredChildren.every((child) => childHasToolCall(child.jsonl, ["read", "bash", "grep"])),
         completedChildReports: requiredChildren.filter((child) => childHasDoneReport(child.jsonl)).length,
         childReportsBeforeTerminal,
         integrationAfterReports: parent ? integrationAfterReports(
@@ -811,7 +829,11 @@ export async function runParallelDiagnosis(): Promise<ParallelScenarioArtifact> 
   const sample = createBenchmarkSample({
     manifest: PARALLEL_DIAGNOSIS_MANIFEST,
     wallTimeMs: result.wallTimeMs,
-    accounting,
+    accounting: {
+      ...accounting,
+      diagnostics: [...accounting.diagnostics, ...result.diagnostics.map((diagnostic) => ({ code: diagnostic.code, message: diagnostic.message }))],
+      diagnosticsDropped: accounting.diagnosticsDropped + result.diagnosticsDropped,
+    },
     launchTrace: result.launchTrace,
     scenarios: [{
       id: PARALLEL_DIAGNOSIS_SCENARIO_ID,
