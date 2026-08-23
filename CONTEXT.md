@@ -11,6 +11,9 @@ Terms used across planning/implementation/skills. Update as they crystallize.
 - **Command routing** — a steer from parent → hub → child, preserving schema.
 - **Interop** — child uses the same model abstraction as the parent (hyper, opencode-go alias routes like provider directly). No custom binary/middleware.
 - **subagentGround** — the hub's ground directory for child session files, pidfiles, and tombstones.
+- **Request probe** — a test-only capture extension (`probe/`, loaded into children via `pi -e`) that records `before_provider_request` payloads to NDJSON. The payload-truth seam for provider verification. Never shipped in the hub.
+- **Named agent / agent preset** — a bundled Markdown definition that gives a child a stable role prompt and default provider, model, thinking level, and tool policy. Explicit spawn arguments override its defaults.
+- **Generic spawn** — a backward-compatible child spawn with no named agent; it keeps the caller-supplied prompt and existing registry defaults.
 
 ## Naming invariants (never change)
 
