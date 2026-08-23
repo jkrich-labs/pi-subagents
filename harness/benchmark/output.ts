@@ -210,7 +210,7 @@ function launchTraceMatchesManifest(trace: readonly BenchmarkLaunchTrace[], mani
   return trace.length > 0 && trace.every((entry) => {
     const expected = scenarios.find((candidate) => candidate.scenarioId === entry.scenarioId && candidate.participant === entry.participant);
     return expected !== undefined && entry.provider === expected.provider && entry.model === expected.model && entry.thinking === expected.thinking &&
-      typeof entry.id === "string" && entry.id !== "" && Number.isInteger(entry.pid) && entry.pid >= -1 && Number.isFinite(entry.startedAt);
+      typeof entry.id === "string" && entry.id !== "" && Number.isInteger(entry.pid) && entry.pid > 0 && Number.isFinite(entry.startedAt) && entry.startedAt > 0;
   }) && scenarios.every((expected) => trace.some((entry) => entry.scenarioId === expected.scenarioId && entry.participant === expected.participant));
 }
 
@@ -259,8 +259,9 @@ export function createBenchmarkOutput(input: CreateBenchmarkOutputInput): Benchm
       .filter((id): id is string => id !== undefined)
     : [];
   const observedTrace = input.samples.flatMap((sample) => sample.launchTrace);
-  const launchTrace = input.launchTrace ?? (observedTrace.length > 0 ? observedTrace : launchTraceForManifest(input.manifest));
-  if (!launchTraceMatchesManifest(launchTrace, input.manifest)) {
+  const launchTrace = input.launchTrace ?? observedTrace;
+  if (launchTrace.length === 0 || !launchTraceMatchesManifest(launchTrace, input.manifest) ||
+      launchTrace.some((entry) => entry.pid <= 0 || entry.startedAt <= 0)) {
     throw new BenchmarkValidationError("benchmark launch trace does not match the active manifest");
   }
   return {

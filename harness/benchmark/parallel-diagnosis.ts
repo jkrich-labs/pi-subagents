@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { accountPersistedSessions, type PersistedSession } from "./accounting.ts";
 import { createBenchmarkSample, type BenchmarkDiagnostic, type BenchmarkSample, type BenchmarkSuiteManifest, type QualityGateResult } from "./contracts.ts";
 import { createParallelDiagnosisFixtureLifecycle, PARALLEL_DIAGNOSIS_ALLOWED_PATHS } from "./fixtures.ts";
-import { PARALLEL_DIAGNOSIS_MANIFEST } from "./profile.ts";
+import { assertBenchmarkSuiteIntegrity, PARALLEL_DIAGNOSIS_MANIFEST } from "./profile.ts";
 import {
   lineHasCompletionFollowUp,
   lineHasTerminalMarker,
@@ -769,6 +769,7 @@ function scenarioContract(port: RealRunnerPort): ScenarioContract {
         childFailure: port.hasChildFailure() || children.some((child) => childHasFailure(child.jsonl)),
         modelPolicyPassed,
         requiredChildCount: requiredChildren.length,
+        distinctRequiredChildren: new Set(requiredSpawns.map((spawn) => spawn?.childId).filter((id): id is string => id !== undefined)).size === PARALLEL_DIAGNOSIS_REQUIREMENTS.expectedRoles.length,
         completedChildReports: requiredChildren.filter((child) => childHasDoneReport(child.jsonl)).length,
         childReportsBeforeTerminal,
         integrationAfterReports: parent ? integrationAfterReports(
@@ -801,6 +802,7 @@ function accountingFor(port: RealRunnerPort): { accounting: ReturnType<typeof ac
 }
 
 export async function runParallelDiagnosis(): Promise<ParallelScenarioArtifact> {
+  assertBenchmarkSuiteIntegrity(PARALLEL_DIAGNOSIS_MANIFEST);
   const sampleDirectory = mkdtempSync(join(tmpdir(), `pi-subagents-${PARALLEL_DIAGNOSIS_SCENARIO_ID}-`));
   const port = new RealRunnerPort(sampleDirectory, PARALLEL_DIAGNOSIS_MANIFEST);
   const result = await runScenario(scenarioContract(port), port);

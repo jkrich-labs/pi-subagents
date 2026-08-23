@@ -135,6 +135,7 @@ test("common scenario runner hard-gates autonomous reports, overlapping children
     childFailure: false,
     modelPolicyPassed: true,
     requiredChildCount: 2,
+    distinctRequiredChildren: true,
     completedChildReports: 2,
     childReportsBeforeTerminal: true,
     integrationAfterReports: true,

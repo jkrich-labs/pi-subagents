@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { accountPersistedSessions, type PersistedSession } from "./accounting.ts";
 import { createBenchmarkSample, type BenchmarkDiagnostic, type BenchmarkSample, type QualityGateResult } from "./contracts.ts";
 import { createParallelImplementationFixtureLifecycle, PARALLEL_IMPLEMENTATION_ALLOWED_PATHS } from "./fixtures.ts";
-import { PARALLEL_IMPLEMENTATION_MANIFEST } from "./profile.ts";
+import { assertBenchmarkSuiteIntegrity, PARALLEL_IMPLEMENTATION_MANIFEST } from "./profile.ts";
 import {
   RealRunnerPort,
   childDoneAt,
@@ -156,6 +156,7 @@ function scenarioContract(port: RealRunnerPort): ScenarioContract {
         childFailure: port.hasChildFailure() || children.some((session) => childHasFailure(session.jsonl)),
         modelPolicyPassed,
         requiredChildCount: requiredChildren.length,
+        distinctRequiredChildren: new Set(required.map((item) => item.spawn?.childId).filter((id): id is string => id !== undefined)).size === PARALLEL_IMPLEMENTATION_REQUIREMENTS.expectedRoles.length,
         completedChildReports: requiredChildren.filter((session) => childHasDoneReport(session.jsonl)).length,
         childReportsBeforeTerminal,
         integrationAfterReports: parent ? integrationAfterReports(
@@ -245,6 +246,7 @@ function accountingFor(port: RealRunnerPort) {
 }
 
 export async function runParallelImplementation(): Promise<ParallelImplementationArtifact> {
+  assertBenchmarkSuiteIntegrity(PARALLEL_IMPLEMENTATION_MANIFEST);
   const sampleDirectory = mkdtempSync(join(tmpdir(), `pi-subagents-${PARALLEL_IMPLEMENTATION_SCENARIO_ID}-`));
   const port = new RealRunnerPort(sampleDirectory, PARALLEL_IMPLEMENTATION_MANIFEST);
   const result = await runScenario(scenarioContract(port), port);

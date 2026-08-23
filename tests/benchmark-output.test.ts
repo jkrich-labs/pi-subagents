@@ -7,6 +7,7 @@ import {
   BENCHMARK_SAMPLE_SCHEMA_VERSION,
   BenchmarkValidationError,
   createBenchmarkSample,
+  type BenchmarkLaunchTrace,
   type BenchmarkSample,
   type QualityGateResult,
   type UsageBreakdown,
@@ -53,6 +54,10 @@ function sample(input: {
     manifest,
     wallTimeMs: input.wallTimeMs,
     accounting: { usage: usage(input.totalTokens), toolFailures: input.toolFailures, diagnostics: [], diagnosticsDropped: 0 },
+    launchTrace: ["diagnosis", "implementation", "review"].flatMap((id): BenchmarkLaunchTrace[] => [
+      { scenarioId: id, participant: "parent", id: `${id}-parent`, pid: 101, startedAt: 1, ...manifest.parent },
+      { scenarioId: id, participant: "child", id: `${id}-child`, pid: 102, startedAt: 1, ...manifest.child },
+    ]),
     scenarios: ["diagnosis", "implementation", "review"].map((id) => ({
       id,
       wallTimeMs: input.wallTimeMs / 3,

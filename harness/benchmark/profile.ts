@@ -17,6 +17,30 @@ export interface CreateBenchmarkSuiteManifestInput {
 }
 
 /** Build a digest-bound suite declaration from any explicit parent/child policy. */
+export function assertBenchmarkSuiteIntegrity(manifest: BenchmarkSuiteManifest): void {
+  const integrity = (manifest.suiteDefinition as { integrity?: typeof BUNDLED_INTEGRITY }).integrity;
+  if (!integrity) return;
+  const actual = {
+    fixtureTemplates: {
+      parallelDiagnosis: digestTree(resolve(FIXTURE_ROOT, "parallel-diagnosis")),
+      parallelImplementation: digestTree(resolve(FIXTURE_ROOT, "parallel-implementation")),
+      reviewConvergence: digestTree(resolve(FIXTURE_ROOT, "review-convergence")),
+    },
+    verifierGuard: digestFile(resolve(BENCHMARK_ROOT, "verifier-guard.mjs")),
+    allowedPaths: integrity.allowedPaths,
+    scenarioSources: {
+      extensionsSubagents: digestTree(resolve(REPOSITORY_ROOT, "extensions/subagents")),
+      rpcChild: digestFile(resolve(REPOSITORY_ROOT, "harness/rpc-child.ts")),
+      parallelDiagnosis: digestFile(resolve(BENCHMARK_ROOT, "parallel-diagnosis.ts")),
+      parallelImplementation: digestFile(resolve(BENCHMARK_ROOT, "parallel-implementation.ts")),
+      reviewConvergence: digestFile(resolve(BENCHMARK_ROOT, "review-convergence.ts")),
+    },
+  };
+  if (JSON.stringify(actual) !== JSON.stringify(integrity)) {
+    throw new Error("benchmark evaluator integrity does not match the active manifest");
+  }
+}
+
 export function createBenchmarkSuiteManifest(input: CreateBenchmarkSuiteManifestInput): BenchmarkSuiteManifest {
   return {
     schemaVersion: 1,

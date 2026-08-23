@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { accountPersistedSessions, type PersistedSession } from "./accounting.ts";
 import { createBenchmarkSample, type BenchmarkDiagnostic, type BenchmarkSample, type QualityGateResult } from "./contracts.ts";
 import { createReviewConvergenceFixtureLifecycle, REVIEW_CONVERGENCE_ALLOWED_PATHS } from "./fixtures.ts";
-import { REVIEW_CONVERGENCE_MANIFEST } from "./profile.ts";
+import { assertBenchmarkSuiteIntegrity, REVIEW_CONVERGENCE_MANIFEST } from "./profile.ts";
 import {
   RealRunnerPort,
   childDoneAt,
@@ -186,6 +186,7 @@ function scenarioContract(port: RealRunnerPort): ScenarioContract {
         childFailure: port.hasChildFailure() || children.some((session) => childHasFailure(session.jsonl)),
         modelPolicyPassed,
         requiredChildCount: requiredChildren.length,
+        distinctRequiredChildren: new Set(required.map((item) => item.spawn?.childId).filter((id): id is string => id !== undefined)).size === REVIEW_CONVERGENCE_REQUIREMENTS.expectedRoles.length,
         completedChildReports: requiredChildren.filter((session) => childHasDoneReport(session.jsonl)).length,
         childReportsBeforeTerminal,
         integrationAfterReports: parent ? reviewIntegrationOrdering(
@@ -273,6 +274,7 @@ function accountingFor(port: RealRunnerPort) {
 }
 
 export async function runReviewConvergence(): Promise<ReviewConvergenceArtifact> {
+  assertBenchmarkSuiteIntegrity(REVIEW_CONVERGENCE_MANIFEST);
   const sampleDirectory = mkdtempSync(join(tmpdir(), `pi-subagents-${REVIEW_CONVERGENCE_SCENARIO_ID}-`));
   const port = new RealRunnerPort(sampleDirectory, REVIEW_CONVERGENCE_MANIFEST);
   const result = await runScenario(scenarioContract(port), port);
