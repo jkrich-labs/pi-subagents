@@ -33,6 +33,7 @@ export function renderTickerLine(v: ChildView, now = Date.now()): TickerLine {
 
   const badges: string[] = [];
   if (v.ask) badges.push("ASK");
+  if (v.attentionKind) badges.push(`ATTN:${v.attentionKind}`);
   if (v.loopHits > 0) badges.push(`LOOP×${v.loopHits}`);
   if (v.stallCount > 0) badges.push(`STALL×${v.stallCount}`);
 

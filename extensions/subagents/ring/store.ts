@@ -10,10 +10,21 @@ export type ChildStatus =
   | "spawning"
   | "working"
   | "asking"
+  | "settled"
   | "done"
   | "failed"
   | "crashed"
   | "killed";
+
+export type AttentionKind =
+  | "settled-without-completion"
+  | "provider-stall"
+  | "tool-stall"
+  | "semantic-stall"
+  | "semantic-loop"
+  | "missed-steer";
+
+export type SteerDeliveryState = "queued" | "delivered" | "missed";
 
 export interface ChildView {
   id: string;
@@ -36,6 +47,17 @@ export interface ChildView {
   sessionFile?: string;
   stallCount: number;
   loopHits: number;
+  isStreaming?: boolean;
+  currentTool?: string;
+  lastActivityAt?: number;
+  lastEventAt?: number;
+  lastHeartbeatAt?: number;
+  attentionKind?: AttentionKind;
+  attentionMessage?: string;
+  attentionAt?: number;
+  steerState?: SteerDeliveryState;
+  steerQueuedAt?: number;
+  lastSteerAt?: number;
 }
 
 export function blankView(): ChildView {

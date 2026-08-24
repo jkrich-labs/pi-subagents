@@ -7,9 +7,9 @@
  */
 import { Ground } from "./ground.ts";
 import { RpcChild, type CommandResponse, type RpcChildHandle, type RpcChildOptions } from "./child.ts";
-import { ring, type ChildView } from "./ring/store.ts";
+import { ring, type AttentionKind, type ChildView } from "./ring/store.ts";
 import { reportFrom as tokenReport } from "./tokens.ts";
-import { makeAskLens, makeCompletionLens, type Lens } from "./lenses.ts";
+import { boundLensText, makeAskLens, makeCompletionLens, type Lens } from "./lenses.ts";
 import { resolveSpawn } from "./registry.ts";
 import { agentRegistry, type AgentToolPolicy } from "./agents.ts";
 
@@ -47,11 +47,41 @@ function validateBenchmarkChildPolicy(policy: BenchmarkChildLaunchPolicy): Bench
 export type Delivery =
   | { type: "lens"; lens: Lens; final: boolean }
   | { type: "ask"; childId: string; question: string }
+  | { type: "attention"; childId: string; kind: AttentionKind; summary: string }
   | { type: "control"; childId: string; token: string; reportDelivered?: boolean }
   | { type: "crash"; childId: string; reason: string };
 
+export interface ChildStatusSnapshot {
+  id: string;
+  title: string;
+  status: ChildView["status"];
+  agent?: string;
+  cwd?: string;
+  provider?: string;
+  model?: string;
+  thinking?: string;
+  alive: boolean;
+  isStreaming: boolean;
+  currentTool?: string;
+  spawnedAt: number;
+  turnCount: number;
+  compactions: number;
+  lastActivityAt?: number;
+  lastEventAt?: number;
+  lastHeartbeatAt?: number;
+  lastCompletionAt?: number;
+  ask?: string;
+  error?: string;
+  attentionKind?: AttentionKind;
+  attentionMessage?: string;
+  attentionAt?: number;
+  steerState?: ChildView["steerState"];
+  steerQueuedAt?: number;
+  lastSteerAt?: number;
+}
+
 const ACTIVE_STATUSES = new Set<ChildView["status"]>(["spawning", "working", "asking"]);
-const REAPABLE_STATUSES = new Set<ChildView["status"]>(["done", "failed"]);
+const REAPABLE_STATUSES = new Set<ChildView["status"]>(["settled", "done", "failed"]);
 const DEFAULT_IDLE_REAP_MS = 5 * 60_000;
 
 interface ChildState {
@@ -74,9 +104,11 @@ interface ChildState {
   pendingTurnMessage?: Record<string, unknown>;
   busy: boolean;
   steerQueued: boolean;
+  pendingSteerText?: string;
   idleReapTimer?: ReturnType<typeof setTimeout>;
   reaping?: boolean;
   terminating?: boolean;
+  transportFailing?: boolean;
 }
 
 export const CHILD_SYSTEM_PROMPT = [
@@ -124,7 +156,7 @@ function terminalErrorOf(message: Record<string, unknown> | undefined): string |
 function stripControlTokens(text: string): string {
   return text
     .split("\n")
-    .filter((line) => !/^(DONE-PARENT|RESET-PARENT|INCR-PARENT|ASK:)\b/.test(line.trim()))
+    .filter((line) => !/^(DONE-PARENT|RESET-PARENT|INCR-PARENT|KEEP-GOING|ASK:)\b/.test(line.trim()))
     .join("\n");
 }
 
@@ -200,6 +232,7 @@ export class Hub {
   /** Liveness engine hooks (S-08) */
   onSpawn: ((id: string) => void) | null = null;
   onExit: ((id: string, reason: string) => void) | null = null;
+  onEvent: ((id: string, line: Record<string, unknown>) => void) | null = null;
   onTurn:
     | ((id: string, rec: {
         toolCallCount: number;
@@ -349,8 +382,6 @@ export class Hub {
         this.deliverFor(state.generation, { type: "crash", childId: id, reason: "process exited" });
       }
     };
-    this.onSpawn?.(id);
-
     ring.upsert(id, {
       id,
       title: launch.title,
@@ -364,7 +395,11 @@ export class Hub {
       toolPolicy: launch.toolPolicy,
       spawnedAt: Date.now(),
       sessionFile: state.sessionFile,
+      isStreaming: true,
+      lastActivityAt: Date.now(),
+      lastEventAt: Date.now(),
     });
+    this.onSpawn?.(id);
 
     void child.send("prompt", { message: prompt }, 10_000).catch(() => {
       /* crash path handles a dead child */
@@ -375,7 +410,41 @@ export class Hub {
   private onLine(id: string, line: Record<string, unknown>): void {
     const st = this.kids.get(id);
     if (!st) return;
-    switch (line.type) {
+    const type = typeof line.type === "string" ? line.type : "";
+    const now = Date.now();
+    const meaningful = type !== "response" && type !== "stderr" && type !== "queue_update";
+    const activityPatch: Partial<ChildView> = meaningful ? { lastEventAt: now, lastActivityAt: now } : {};
+    if (type === "agent_start") {
+      st.busy = true;
+      Object.assign(activityPatch, {
+        status: "working" as const,
+        isStreaming: true,
+        ask: undefined,
+        error: undefined,
+        attentionKind: undefined,
+        attentionMessage: undefined,
+        attentionAt: undefined,
+      });
+    } else if (type === "agent_settled") {
+      Object.assign(activityPatch, { isStreaming: false, currentTool: undefined });
+    } else if (type === "tool_execution_start") {
+      Object.assign(activityPatch, {
+        isStreaming: true,
+        currentTool: typeof line.toolName === "string" ? line.toolName : "unknown",
+      });
+    } else if (type === "tool_execution_end") {
+      Object.assign(activityPatch, { currentTool: undefined });
+    } else if (type.startsWith("message_") || type === "turn_start" || type === "turn_end") {
+      Object.assign(activityPatch, { isStreaming: true });
+      if (type === "turn_start" && st.steerQueued && ring.get(id)?.steerState === "queued") {
+        st.pendingSteerText = undefined;
+        Object.assign(activityPatch, { steerState: "delivered" as const, lastSteerAt: now });
+      }
+    }
+    if (Object.keys(activityPatch).length > 0) ring.upsert(id, activityPatch);
+    this.onEvent?.(id, line);
+
+    switch (type) {
       case "turn_end":
         st.turnCount += 1;
         ring.upsert(id, { turnCount: st.turnCount });
@@ -414,11 +483,23 @@ export class Hub {
         st.compactions += 1;
         ring.upsert(id, { compactions: st.compactions });
         break;
-      case "agent_settled":
+      case "agent_settled": {
+        const missedSteer = st.steerQueued && ring.get(id)?.steerState === "queued";
+        const missedSteerText = st.pendingSteerText;
         st.busy = false;
         st.steerQueued = false;
+        st.pendingSteerText = undefined;
         this.finalize(st);
+        if (missedSteer) {
+          ring.upsert(id, { steerState: "missed" });
+          this.reportAttention(
+            id,
+            "missed-steer",
+            `The child accepted guidance but settled before a subsequent turn could consume it. Its final report may reflect the previous instructions. Missed guidance: ${boundLensText(missedSteerText ?? "(unavailable)")}`,
+          );
+        }
         break;
+      }
       default:
         break;
     }
@@ -466,6 +547,26 @@ export class Hub {
     st.idleReapTimer.unref?.();
   }
 
+  reportAttention(id: string, kind: AttentionKind, summary: string): boolean {
+    const st = this.kids.get(id);
+    const view = ring.get(id);
+    if (!st || !view || view.attentionKind === kind) return false;
+    const bounded = boundLensText(summary || "No diagnostic was provided.");
+    ring.upsert(id, {
+      attentionKind: kind,
+      attentionMessage: bounded,
+      attentionAt: Date.now(),
+    });
+    this.deliverFor(st.generation, { type: "attention", childId: id, kind, summary: bounded });
+    return true;
+  }
+
+  clearAttention(id: string, kinds?: readonly AttentionKind[]): void {
+    const view = ring.get(id);
+    if (!view?.attentionKind || (kinds && !kinds.includes(view.attentionKind))) return;
+    ring.upsert(id, { attentionKind: undefined, attentionMessage: undefined, attentionAt: undefined });
+  }
+
   /** Finalize a settled run into a lens (idempotent per agent_end cursor). */
   private finalize(st: ChildState): void {
     const ends = st.child.events("agent_end");
@@ -492,7 +593,12 @@ export class Hub {
         status: "failed",
         error: reason,
         ask: undefined,
+        isStreaming: false,
+        currentTool: undefined,
         lastCompletionAt: Date.now(),
+        attentionKind: undefined,
+        attentionMessage: undefined,
+        attentionAt: undefined,
       });
       this.scheduleIdleReap(st);
       this.deliverFor(st.generation, { type: "crash", childId: st.id, reason });
@@ -502,7 +608,16 @@ export class Hub {
     const report = tokenReport(finalText);
 
     if (report.ask) {
-      ring.upsert(st.id, { status: "asking", ask: report.ask, error: undefined });
+      ring.upsert(st.id, {
+        status: "asking",
+        ask: report.ask,
+        error: undefined,
+        isStreaming: false,
+        currentTool: undefined,
+        attentionKind: undefined,
+        attentionMessage: undefined,
+        attentionAt: undefined,
+      });
       this.deliverFor(st.generation, {
         type: "ask",
         childId: st.id,
@@ -513,24 +628,24 @@ export class Hub {
 
     const clean = stripControlTokens(finalText).trim();
     if (clean.length > 0) {
-      ring.upsert(st.id, {
-        status: report.done ? "done" : "working",
-        ask: undefined,
-        error: undefined,
-        lastCompletionAt: Date.now(),
-      });
       this.deliverFor(st.generation, {
         type: "lens",
         lens: makeCompletionLens(st.id, clean, st.sessionFile),
         final: report.done,
       });
-    } else if (report.done) {
-      ring.upsert(st.id, { status: "done", ask: undefined, error: undefined, lastCompletionAt: Date.now() });
     }
-
-    if (report.reset) ring.upsert(st.id, { lastCompletionAt: undefined, status: "working", error: undefined });
     if (report.incr) ring.upsert(st.id, { scopeCount: (ring.get(st.id)?.scopeCount ?? 0) + 1 });
+
     if (report.done) {
+      ring.upsert(st.id, {
+        status: "done",
+        ask: undefined,
+        error: undefined,
+        lastCompletionAt: Date.now(),
+        attentionKind: undefined,
+        attentionMessage: undefined,
+        attentionAt: undefined,
+      });
       this.scheduleIdleReap(st);
       this.deliverFor(st.generation, {
         type: "control",
@@ -538,7 +653,35 @@ export class Hub {
         token: "DONE-PARENT",
         reportDelivered: clean.length > 0,
       });
+    } else if (report.keepGoing) {
+      ring.upsert(st.id, {
+        status: "working",
+        ask: undefined,
+        error: undefined,
+        attentionKind: undefined,
+        attentionMessage: undefined,
+        attentionAt: undefined,
+      });
+      void this.steer(st.id, "Continue your assigned work. Report only when complete or blocked.").catch((error) => {
+        this.reportAttention(st.id, "semantic-stall", `KEEP-GOING was accepted but continuation failed: ${safeErrorDetail(String(error))}`);
+      });
+    } else {
+      ring.upsert(st.id, {
+        status: "settled",
+        ask: undefined,
+        error: undefined,
+        lastCompletionAt: clean.length > 0 ? Date.now() : undefined,
+      });
+      this.scheduleIdleReap(st);
+      this.reportAttention(
+        st.id,
+        "settled-without-completion",
+        clean.length > 0
+          ? clean
+          : "The child settled without DONE-PARENT, an ASK, or a textual report.",
+      );
     }
+
     if (report.reset) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "RESET-PARENT" });
     if (report.incr) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "INCR-PARENT" });
   }
@@ -558,8 +701,8 @@ export class Hub {
       const st = this.kids.get(id);
       if (!st || !st.child.isRunning()) continue;
       const status = ring.get(id)?.status;
-      if (status !== undefined && !ACTIVE_STATUSES.has(status) && status !== "done") continue;
-      const wasIdle = status === "done";
+      if (status !== undefined && !ACTIVE_STATUSES.has(status) && status !== "done" && status !== "settled") continue;
+      const wasIdle = status === "done" || status === "settled";
       const busy = st.busy;
       if (busy && st.steerQueued) continue;
       any = true;
@@ -579,8 +722,25 @@ export class Hub {
       }
       if (this.kids.get(id) === st && st.finalizedEnds === finalizedBefore) {
         st.busy = true;
-        if (busy) st.steerQueued = true;
-        ring.upsert(id, { status: "working", ask: undefined, error: undefined });
+        if (busy) {
+          st.steerQueued = true;
+          st.pendingSteerText = text;
+        } else {
+          st.pendingSteerText = undefined;
+        }
+        ring.upsert(id, {
+          status: "working",
+          ask: undefined,
+          error: undefined,
+          isStreaming: true,
+          lastActivityAt: Date.now(),
+          attentionKind: undefined,
+          attentionMessage: undefined,
+          attentionAt: undefined,
+          steerState: busy ? "queued" : "delivered",
+          steerQueuedAt: busy ? Date.now() : undefined,
+          lastSteerAt: busy ? undefined : Date.now(),
+        });
       } else if (wasIdle && this.kids.get(id) === st) {
         this.scheduleIdleReap(st);
       }
@@ -614,8 +774,66 @@ export class Hub {
     }
   }
 
+  async failTransport(id: string, reason: string): Promise<void> {
+    return this.withLifecycleLock(async () => {
+      const st = this.kids.get(id);
+      if (!st || st.transportFailing) return;
+      st.transportFailing = true;
+      this.cancelIdleReap(st);
+      st.child.setLineHandler(() => {});
+      st.child.onExit = null;
+      ring.upsert(id, {
+        status: "crashed",
+        error: reason,
+        isStreaming: false,
+        currentTool: undefined,
+      });
+      this.deliverFor(st.generation, { type: "crash", childId: id, reason });
+      try {
+        st.terminating = true;
+        st.child.kill();
+        await st.child.shutdown();
+      } finally {
+        this.kids.delete(id);
+        this.onExit?.(id, reason);
+      }
+    });
+  }
+
   list(): string[] {
     return [...this.kids.keys()];
+  }
+
+  statuses(id?: string): ChildStatusSnapshot[] {
+    const views = id ? [ring.get(id)].filter((view): view is ChildView => view !== undefined) : ring.list();
+    return views.map((view) => ({
+      id: view.id,
+      title: view.title,
+      status: view.status,
+      agent: view.agent,
+      cwd: view.cwd,
+      provider: view.provider,
+      model: view.model,
+      thinking: view.thinking,
+      alive: this.isAlive(view.id),
+      isStreaming: view.isStreaming ?? false,
+      currentTool: view.currentTool,
+      spawnedAt: view.spawnedAt,
+      turnCount: view.turnCount,
+      compactions: view.compactions,
+      lastActivityAt: view.lastActivityAt,
+      lastEventAt: view.lastEventAt,
+      lastHeartbeatAt: view.lastHeartbeatAt,
+      lastCompletionAt: view.lastCompletionAt,
+      ask: view.ask,
+      error: view.error,
+      attentionKind: view.attentionKind,
+      attentionMessage: view.attentionMessage,
+      attentionAt: view.attentionAt,
+      steerState: view.steerState,
+      steerQueuedAt: view.steerQueuedAt,
+      lastSteerAt: view.lastSteerAt,
+    }));
   }
 
   isAlive(id: string): boolean {
@@ -662,7 +880,7 @@ export class Hub {
     const state = this.kids.get(id);
     if (state?.child.isRunning()) {
       // A settled child is an idle, reusable thread. A follow-up must wake it.
-      if (view.status === "done" && prompt) return this.steerUnlocked(id, prompt);
+      if ((view.status === "done" || view.status === "settled") && prompt) return this.steerUnlocked(id, prompt);
       if (view.status === "failed") await this.reapState(state, true);
       else return true;
     }
@@ -733,8 +951,18 @@ export class Hub {
         this.deliverFor(st.generation, { type: "crash", childId: id, reason: "process exited" });
       }
     };
+    ring.upsert(id, {
+      status: "working",
+      ask: undefined,
+      error: undefined,
+      isStreaming: Boolean(prompt),
+      lastActivityAt: Date.now(),
+      lastEventAt: Date.now(),
+      attentionKind: undefined,
+      attentionMessage: undefined,
+      attentionAt: undefined,
+    });
     this.onSpawn?.(id);
-    ring.upsert(id, { status: "working", ask: undefined, error: undefined });
     if (prompt) void child.send("prompt", { message: prompt }, 10_000).catch(() => {});
     return true;
   }

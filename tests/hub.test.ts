@@ -57,6 +57,7 @@ test("reportFrom: DONE/RESET/INCR/ASK tokens", () => {
     ask: "shall I proceed?",
   });
   assert.equal(reportFrom("INCR-PARENT").incr, true);
+  assert.equal(reportFrom("KEEP-GOING").keepGoing, true);
   assert.equal(reportFrom("plain report").done, false);
 });
 
@@ -233,6 +234,107 @@ test("hub: a completed child can be steered again while it remains idle", async 
     assert.equal(recorder.commands.at(-1)?.command, "prompt", "settled children receive a fresh prompt");
     assert.equal(recorder.commands.at(-1)?.body.message, "continue from the first pass");
     assert.equal(hub.getView(id)?.status, "working", "a resumed child is visible as active");
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: settled work without DONE-PARENT becomes model-visible attention instead of silent working", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: (delivery) => deliveries.push(delivery), spawnChild: recorder.spawnChild });
+
+  try {
+    const id = await hub.spawn({ title: "unmarked", prompt: "Complete the task" });
+    const assistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "The task is complete and all checks pass." }],
+      stopReason: "stop",
+    };
+    const emit = recorder.handlers[0];
+    assert.ok(emit);
+    emit({ type: "turn_end", message: assistant });
+    emit({ type: "agent_end", messages: [assistant] });
+    emit({ type: "agent_settled" });
+    emit({ type: "agent_settled" });
+
+    assert.equal(hub.getView(id)?.status, "settled", "settled is distinct from actively working");
+    assert.equal(hub.isAlive(id), true, "the idle session remains reusable");
+    const attentions = deliveries.filter((delivery) => (delivery as { type: string }).type === "attention") as Array<{
+      type: "attention";
+      childId: string;
+      kind: string;
+      summary: string;
+    }>;
+    assert.equal(attentions.length, 1, "duplicate settlement cannot produce repeated wake-ups");
+    assert.equal(attentions[0].kind, "settled-without-completion");
+    assert.match(attentions[0].summary, /task is complete.*checks pass/i);
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: accepted steering records delivered versus missed boundaries", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: (delivery) => deliveries.push(delivery), spawnChild: recorder.spawnChild });
+
+  try {
+    const missedId = await hub.spawn({ title: "missed-steer", prompt: "work" });
+    assert.equal(await hub.steer(missedId, "new guidance"), true);
+    assert.equal(hub.getView(missedId)?.steerState, "queued");
+    const done = {
+      role: "assistant",
+      content: [{ type: "text", text: "Finished old work\nDONE-PARENT" }],
+      stopReason: "stop",
+    };
+    recorder.handlers[0]?.({ type: "turn_end", message: done });
+    recorder.handlers[0]?.({ type: "agent_end", messages: [done] });
+    recorder.handlers[0]?.({ type: "agent_settled" });
+    assert.equal(hub.getView(missedId)?.steerState, "missed");
+    assert.ok(deliveries.some(
+      (delivery) => delivery.type === "attention" && delivery.kind === "missed-steer" && /new guidance/.test(delivery.summary),
+    ));
+
+    const deliveredId = await hub.spawn({ title: "delivered-steer", prompt: "work" });
+    assert.equal(await hub.steer(deliveredId, "new guidance"), true);
+    recorder.handlers[1]?.({ type: "turn_start" });
+    assert.equal(hub.getView(deliveredId)?.steerState, "delivered");
+    recorder.handlers[1]?.({ type: "turn_end", message: done });
+    recorder.handlers[1]?.({ type: "agent_end", messages: [done] });
+    recorder.handlers[1]?.({ type: "agent_settled" });
+    assert.equal(
+      deliveries.filter((delivery) => delivery.type === "attention" && delivery.childId === deliveredId && delivery.kind === "missed-steer").length,
+      0,
+    );
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: KEEP-GOING starts a fresh continuation instead of becoming an idle orphan", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: (delivery) => deliveries.push(delivery), spawnChild: recorder.spawnChild });
+
+  try {
+    const id = await hub.spawn({ title: "intentional-wait", prompt: "work" });
+    const keepGoing = {
+      role: "assistant",
+      content: [{ type: "text", text: "KEEP-GOING" }],
+      stopReason: "stop",
+    };
+    recorder.handlers[0]?.({ type: "turn_end", message: keepGoing });
+    recorder.handlers[0]?.({ type: "agent_end", messages: [keepGoing] });
+    recorder.handlers[0]?.({ type: "agent_settled" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(hub.getView(id)?.status, "working");
+    assert.equal(recorder.commands.filter((command) => command.command === "prompt").length, 2, "continuation uses a new idle prompt");
+    assert.equal(deliveries.some((delivery) => delivery.type === "attention"), false);
   } finally {
     await hub.shutdownAll();
   }

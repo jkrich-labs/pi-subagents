@@ -34,7 +34,7 @@ export type Lens = CompletionLens | AskLens | StallLens;
 
 const MAX_DIGEST_CHARS = 4000;
 
-function truncateWords(text: string, words: number): string {
+export function boundLensText(text: string, words = 150): string {
   const parts = text.trim().split(/\s+/);
   const wordBounded = parts.length <= words ? text.trim() : `${parts.slice(0, words).join(" ")} …`;
   if (wordBounded.length <= MAX_DIGEST_CHARS) return wordBounded;
@@ -48,7 +48,7 @@ export function makeCompletionLens(childId: string, finalText: string, sessionFi
     childId,
     ref: childId,
     sessionPath: sessionFile ?? join("(no session file — abnormal)", ""),
-    digest: truncateWords(finalText, 150),
+    digest: boundLensText(finalText),
     lastTurnAt: now,
   };
 }
@@ -57,7 +57,7 @@ export function makeAskLens(childId: string, question: string, sessionFile: stri
   return {
     type: "ask",
     childId,
-    question: truncateWords(question, 150),
+    question: boundLensText(question),
     sessionPath: sessionFile ?? "",
     at: now,
   };

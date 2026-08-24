@@ -12,14 +12,17 @@ export interface ChildReport {
   reset: boolean;
   incr: boolean;
   ask?: string;
+  keepGoing?: true;
 }
 
 export function reportFrom(text: string): ChildReport {
+  const keepGoing = text.split("\n").some((line) => line.trim() === "KEEP-GOING");
   return {
     done: text.includes(DONE),
     reset: text.includes(RESET),
     incr: text.includes(INCR),
     ask: askFrom(text),
+    ...(keepGoing ? { keepGoing: true as const } : {}),
   };
 }
 

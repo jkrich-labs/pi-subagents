@@ -10,6 +10,10 @@ export interface Tombstone {
   reason: string;
   lastCursor: string | null;
   at: string;
+  sessionFile?: string;
+  title?: string;
+  provider?: string;
+  model?: string;
 }
 
 export interface TombstoneWriter {

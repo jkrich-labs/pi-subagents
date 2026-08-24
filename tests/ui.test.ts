@@ -26,6 +26,7 @@ import subagentsExtension, {
   spawnToolResult,
   subagentCommand,
   deliverToParent,
+  ParentDeliveryQueue,
 } from "../extensions/subagents/index.ts";
 import { attachFleetEditorNavigation, FleetWidget } from "../extensions/subagents/ui/focus.ts";
 
@@ -47,6 +48,7 @@ test("ticker line shows status, model::thinking, turns, compactions, elapsed, la
       compactions: 2,
       lastCompletionAt: now - 5_000,
       ask: "which file?",
+      attentionKind: "provider-stall",
       loopHits: 3,
       stallCount: 1,
     }),
@@ -59,6 +61,7 @@ test("ticker line shows status, model::thinking, turns, compactions, elapsed, la
   assert.ok(line.text.includes("1m05s"), "elapsed");
   assert.ok(line.text.includes("last+5s"), "last completion");
   assert.ok(line.badge.includes("ASK"), "ask badge");
+  assert.ok(line.badge.includes("ATTN:provider-stall"), "attention badge");
   assert.ok(line.badge.includes("LOOP×3"), "loop badge");
   assert.ok(line.badge.includes("STALL×1"), "stall badge");
 });
@@ -473,6 +476,11 @@ test("extension prevents parent polling and exposes Cursor-compatible delegation
   assert.ok(tools.has("Task"), "Cursor-trained models receive the Task delegation affordance");
   assert.ok(tools.has("AwaitShell"), "Cursor-trained models receive a safe AwaitShell compatibility affordance");
   assert.ok(tools.has("steer_subagent"), "parents can steer without leaking @child control text into assistant output");
+  assert.ok(tools.has("get_subagent_status"), "parents have bounded read-only recovery introspection");
+  assert.ok(
+    tools.get("get_subagent_status").promptGuidelines?.some((line: string) => /do not.*poll/i.test(line)),
+    "status introspection is explicitly non-polling",
+  );
   assert.ok(
     tools.get("steer_subagent").promptGuidelines?.some((line: string) => /never emit.*@child/i.test(line)),
     "the model-visible steering contract forbids assistant-text control messages",
@@ -497,6 +505,18 @@ test("extension prevents parent polling and exposes Cursor-compatible delegation
     /not live/i,
     "a done child is sent to the hub for reuse instead of being rejected as done",
   );
+  ring.upsert("attention-child", {
+    title: "quiet provider",
+    status: "working",
+    isStreaming: true,
+    lastActivityAt: 123,
+    attentionKind: "provider-stall",
+    attentionMessage: "No model output for 2m",
+    attentionAt: 456,
+  });
+  const statusResult = await tools.get("get_subagent_status").execute("call", { child_id: "attention-child" });
+  assert.match(statusResult.content[0].text, /attention-child.*working.*streaming.*provider-stall.*No model output/is);
+  assert.equal(statusResult.details.children[0].systemPrompt, undefined, "status details do not leak child prompts");
   ring.reset();
   assert.deepEqual(await tools.get("AwaitShell").execute(), {
     content: [{ type: "text", text: "Background tasks report completion automatically. End this turn now; do not poll or sleep." }],
@@ -562,6 +582,80 @@ test("final child reports become one bounded model-visible wake-up without a ret
   assert.equal(messages.length, 2, "token-only completion wakes the parent");
   assert.match(messages[1].text, /empty-report-child.*COMPLETED.*no textual report/i);
   assert.deepEqual(messages[1].options, { deliverAs: "steer" });
+});
+
+test("attention deliveries wake the parent once with a bounded diagnostic", () => {
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const messages: Array<{ text: string; options: unknown }> = [];
+  const pi = {
+    appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
+    sendUserMessage(text: string, options: unknown) { messages.push({ text, options }); },
+  } as any;
+
+  deliverToParent(pi, {
+    type: "attention",
+    childId: "quiet-child",
+    kind: "provider-stall",
+    summary: "x".repeat(10_000),
+  } as any);
+
+  assert.equal(entries[0].type, "subagent_attention");
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].text, /quiet-child.*NEEDS ATTENTION.*provider-stall/is);
+  assert.ok(messages[0].text.length <= 4200, "attention diagnostics stay bounded");
+  assert.deepEqual(messages[0].options, { deliverAs: "steer" });
+});
+
+test("parent delivery queue coalesces wake-ups and restores unacknowledged messages", async () => {
+  const entries: Array<{ type: string; customType: string; data: any }> = [];
+  const messages: string[] = [];
+  const pi = {
+    appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+    sendUserMessage(text: string) { messages.push(text); },
+  } as any;
+  const queue = new ParentDeliveryQueue(pi, 0);
+  queue.enqueue({ type: "ask", childId: "child-a", question: "first?" });
+  queue.enqueue({ type: "attention", childId: "child-b", kind: "provider-stall", summary: "quiet" });
+  for (let i = 0; i < 20 && messages.length === 0; i++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+
+  assert.equal(messages.length, 1, "near-simultaneous child events share one safe-boundary wake-up");
+  assert.match(messages[0], /child-a.*ASK.*child-b.*NEEDS ATTENTION/is);
+  const pendingEntries = entries.filter((entry) => entry.customType === "subagent_delivery_pending");
+  assert.equal(pendingEntries.length, 2, "wake-ups are journalled before send");
+  assert.equal(entries.filter((entry) => entry.customType === "subagent_delivery_delivered").length, 0, "queue acceptance is not mistaken for model delivery");
+  queue.acknowledgeMessage({ role: "user", content: [{ type: "text", text: messages[0] }] });
+  assert.equal(
+    entries.filter((entry) => entry.customType === "subagent_delivery_delivered").length,
+    2,
+    "the durable journal is acknowledged only when the synthetic user message enters history",
+  );
+  queue.dispose();
+
+  const restoredMessages: string[] = [];
+  const restoredEntries: Array<{ type: string; customType: string; data: any }> = [];
+  const restoredPi = {
+    appendEntry(customType: string, data: unknown) { restoredEntries.push({ type: "custom", customType, data }); },
+    sendUserMessage(text: string) { restoredMessages.push(text); },
+  } as any;
+  const restored = new ParentDeliveryQueue(restoredPi, 0);
+  restored.restore([
+    { type: "custom", customType: "subagent_delivery_pending", data: { id: "lost-1", message: "recover me" } },
+    { type: "custom", customType: "subagent_delivery_pending", data: { id: "done-1", message: "do not repeat" } },
+    { type: "custom", customType: "subagent_delivery_delivered", data: { id: "done-1" } },
+    { type: "custom", customType: "subagent_delivery_pending", data: { id: "history-1", message: "already in history" } },
+    { type: "message", message: { role: "user", content: "[subagent-deliveries:history-1]\nalready in history" } },
+  ]);
+  for (let i = 0; i < 20 && restoredMessages.length === 0; i++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(restoredMessages.length, 1);
+  assert.match(restoredMessages[0], /recover me/);
+  assert.doesNotMatch(restoredMessages[0], /do not repeat/);
+  restored.acknowledgeMessage({ role: "user", content: restoredMessages[0] });
+  assert.equal(restoredEntries.at(-1)?.customType, "subagent_delivery_delivered");
+  restored.dispose();
 });
 
 test("ASK follow-ups use the same bounded digest policy", () => {

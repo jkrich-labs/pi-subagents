@@ -9,6 +9,7 @@ export interface ProbeResult {
   message: string;
   cooldown: number;
   escalate: boolean;
+  state: ProbeState;
 }
 
 export interface ProbeState {
@@ -28,32 +29,32 @@ export function probeDecision(prev: ProbeState, trip: "stall" | "loop", childSai
   let fires = prev.fires;
   let cooldown = prev.cooldownTurns;
   let unaddressed = prev.unaddressed;
-  let escalate = false;
 
   if (childSaidKeepGoing) {
-    // ×2 per re-fire
-    cooldown = Math.max(cooldown, 1) * 2;
-    unaddressed = 0;
-    return { probe: false, message: "", cooldown, escalate: false };
+    const state = applyKeepGoing(prev);
+    return { probe: false, message: "", cooldown: state.cooldownTurns, escalate: false, state };
   }
 
   if (cooldown > 0 && !cooldownExpired) {
-    return { probe: false, message: "", cooldown, escalate: false };
+    return { probe: false, message: "", cooldown, escalate: false, state: { cooldownTurns: cooldown, fires, unaddressed } };
   }
 
-  if (cooldown > 0 && cooldownExpired) {
-    cooldown = 0;
-  }
+  if (cooldown > 0 && cooldownExpired) cooldown = 0;
 
-  if (prev.unaddressed >= 2) {
-    escalate = true;
-    return { probe: false, message: "", cooldown, escalate };
+  if (unaddressed >= 2) {
+    return { probe: false, message: "", cooldown, escalate: true, state: { cooldownTurns: cooldown, fires, unaddressed } };
   }
 
   fires += 1;
   unaddressed += 1;
   const message = trip === "stall" ? PROBE_STALL_MSG : PROBE_LOOP_MSG;
-  return { probe: true, message, cooldown, escalate };
+  return {
+    probe: true,
+    message,
+    cooldown,
+    escalate: false,
+    state: { cooldownTurns: cooldown, fires, unaddressed },
+  };
 }
 
 export function applyKeepGoing(prev: ProbeState): ProbeState {

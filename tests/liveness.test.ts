@@ -13,6 +13,47 @@ import { probeDecision, applyKeepGoing } from "../extensions/subagents/liveness/
 import { freshHeartbeat, heartbeatTick, MISSES_TO_TERMINATE } from "../extensions/subagents/liveness/heartbeat.ts";
 import { writePidfile, sweep } from "../extensions/subagents/liveness/orphan-reaper.ts";
 import { Ground } from "../extensions/subagents/ground.ts";
+import { Hub, type Delivery } from "../extensions/subagents/hub.ts";
+import type { CommandResponse, RpcChildHandle, WireLine } from "../extensions/subagents/child.ts";
+import { LivenessEngine } from "../extensions/subagents/liveness/engine.ts";
+import { ring } from "../extensions/subagents/ring/store.ts";
+
+function controlledChild(options: {
+  getState?: () => Promise<CommandResponse>;
+} = {}): {
+  child: RpcChildHandle;
+  emit: (line: WireLine) => void;
+  commands: string[];
+} {
+  const lines: WireLine[] = [];
+  const commands: string[] = [];
+  let handler: ((line: WireLine) => void) | null = null;
+  let running = true;
+  const child: RpcChildHandle = {
+    proc: { pid: 2_000_000_000 },
+    lines,
+    sessionFile: "/sessions/controlled.jsonl",
+    onExit: null,
+    setLineHandler(fn) { handler = fn; },
+    async send(command: string): Promise<CommandResponse> {
+      commands.push(command);
+      if (command === "get_state" && options.getState) return options.getState();
+      return { command, success: true };
+    },
+    events(type: string) { return lines.filter((line) => line.type === type); },
+    isRunning() { return running; },
+    kill() { running = false; },
+    async shutdown() { running = false; },
+  };
+  return {
+    child,
+    commands,
+    emit(line) {
+      lines.push(line);
+      handler?.(line);
+    },
+  };
+}
 
 test("loop fingerprint flags a 10× repeated tool-multiset+args window; not varied work", () => {
   const repeat = (n: number) =>
@@ -77,10 +118,10 @@ test("probe escalates only after unaddressed + still-tripping; KEEP-GOING cools"
   let p = { cooldownTurns: 0, fires: 0, unaddressed: 0 };
   const d1 = probeDecision(p, "stall", false, true);
   assert.equal(d1.probe, true);
-  p = { ...p, cooldownTurns: d1.cooldown, unaddressed: p.unaddressed + 1 };
+  p = d1.state;
   const d2 = probeDecision(p, "stall", false, true);
   assert.equal(d2.probe, true);
-  p = { ...p, cooldownTurns: d2.cooldown, unaddressed: p.unaddressed + 1 };
+  p = d2.state;
   const d3 = probeDecision(p, "stall", false, true);
   assert.equal(d3.escalate, true, "third unaddressed trip escalates to human");
   assert.equal(d3.probe, false, "escalation replaces probing");
@@ -121,6 +162,146 @@ test("reaper: dead parent's pidfile orphan is reclaimed; live parent untouched",
   assert.equal(killed.length, 0, "orphan pid was already nonexistent; live-child untouched");
 });
 
+test("engine: responsive but quiet inference raises attention without killing the child", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const controlled = controlledChild({
+    getState: async () => ({
+      command: "get_state",
+      success: true,
+      data: { isStreaming: true },
+    }),
+  });
+  const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-stall-")));
+  const hub = new Hub({ ground, deliver: (delivery) => deliveries.push(delivery), spawnChild: async () => controlled.child });
+  const engine = new LivenessEngine(hub, ground.tombstones, {
+    heartbeatQuietMs: 0,
+    providerQuietMs: 10,
+    toolQuietMs: 100,
+  });
+
+  const id = await hub.spawn({ title: "quiet-inference", prompt: "work" });
+  controlled.emit({ type: "agent_start" });
+  controlled.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+  const quietSince = hub.getView(id)?.lastActivityAt ?? Date.now();
+  engine.tick(quietSince + 11);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(hub.isAlive(id), true, "semantic suspicion never kills a responsive child");
+  assert.equal(hub.getView(id)?.attentionKind, "provider-stall");
+  assert.equal(
+    deliveries.filter((delivery) => (delivery as { type: string }).type === "attention").length,
+    1,
+    "the idle parent receives one proactive wake-up",
+  );
+
+  engine.tick(quietSince + 1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(
+    deliveries.filter((delivery) => (delivery as { type: string }).type === "attention").length,
+    1,
+    "one quiet episode cannot create a wake-up loop",
+  );
+  controlled.emit({
+    type: "message_update",
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "progress" },
+  });
+  assert.equal(hub.getView(id)?.attentionKind, undefined, "new progress closes the attention episode");
+  await hub.shutdownAll();
+});
+
+test("engine: heartbeats do not overlap and mid-tool misses cannot terminate", async () => {
+  ring.reset();
+  let rejectState!: (error: Error) => void;
+  let statePromise = new Promise<CommandResponse>((_resolve, reject) => { rejectState = reject; });
+  const controlled = controlledChild({ getState: () => statePromise });
+  const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-heartbeat-")));
+  const hub = new Hub({ ground, deliver: () => {}, spawnChild: async () => controlled.child });
+  const engine = new LivenessEngine(hub, ground.tombstones, {
+    heartbeatQuietMs: 0,
+    providerQuietMs: Number.POSITIVE_INFINITY,
+    toolQuietMs: Number.POSITIVE_INFINITY,
+  });
+
+  const id = await hub.spawn({ title: "long-tool", prompt: "work" });
+  controlled.emit({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: {} });
+  engine.tick(Date.now() + 1);
+  engine.tick(Date.now() + 2);
+  engine.tick(Date.now() + 3);
+  assert.equal(controlled.commands.filter((command) => command === "get_state").length, 1, "one heartbeat may be in flight per child");
+
+  for (let miss = 0; miss < 4; miss++) {
+    rejectState(new Error("rpc unavailable"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    statePromise = new Promise<CommandResponse>((_resolve, reject) => { rejectState = reject; });
+    engine.tick(Date.now() + 10 + miss);
+  }
+  rejectState(new Error("rpc unavailable"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(hub.isAlive(id), true, "heartbeat misses during a known running tool are non-fatal");
+  await hub.shutdownAll();
+});
+
+test("engine: unaddressed semantic loop probes escalate to parent attention without a kill", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const controlled = controlledChild();
+  const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-loop-")));
+  const hub = new Hub({ ground, deliver: (delivery) => deliveries.push(delivery), spawnChild: async () => controlled.child });
+  new LivenessEngine(hub, ground.tombstones, {
+    heartbeatQuietMs: Number.POSITIVE_INFINITY,
+    providerQuietMs: Number.POSITIVE_INFINITY,
+    toolQuietMs: Number.POSITIVE_INFINITY,
+  });
+  const id = await hub.spawn({ title: "looping", prompt: "work" });
+  const message = {
+    role: "assistant",
+    content: [
+      { type: "text", text: "still investigating the same failing output" },
+      { type: "toolCall", id: "call", name: "read", arguments: { path: "same" } },
+    ],
+    stopReason: "toolUse",
+  };
+  for (let turn = 0; turn < 5; turn++) {
+    controlled.emit({ type: "turn_end", message, toolResults: [{ output: "same" }] });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(hub.isAlive(id), true);
+  assert.equal(hub.getView(id)?.attentionKind, "semantic-loop");
+  assert.ok(deliveries.some((delivery) => delivery.type === "attention" && delivery.kind === "semantic-loop"));
+  await hub.shutdownAll();
+});
+
+test("engine: three transport misses produce one exact failure and release the child", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const controlled = controlledChild({
+    getState: async () => { throw new Error("rpc unavailable"); },
+  });
+  const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-dead-")));
+  const hub = new Hub({ ground, deliver: (delivery) => deliveries.push(delivery), spawnChild: async () => controlled.child });
+  const engine = new LivenessEngine(hub, ground.tombstones, {
+    heartbeatQuietMs: 0,
+    providerQuietMs: Number.POSITIVE_INFINITY,
+    toolQuietMs: Number.POSITIVE_INFINITY,
+  });
+  const id = await hub.spawn({ title: "dead-rpc", prompt: "work" });
+
+  for (let miss = 0; miss < 3; miss++) {
+    engine.tick(Date.now() + miss);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(hub.isAlive(id), false);
+  const crashes = deliveries.filter((delivery) => delivery.type === "crash");
+  assert.equal(crashes.length, 1);
+  assert.match(crashes[0].type === "crash" ? crashes[0].reason : "", /transport-dead.*3 heartbeat misses/i);
+  assert.equal(hub.getView(id)?.status, "crashed");
+  await hub.shutdownAll();
+});
+
 test("engine integration: spawn, probe liveness, tombstone on kill", { timeout: 240_000, concurrency: 1 }, async () => {
   const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-live-")));
   const { Hub } = await import("../extensions/subagents/hub.ts");
@@ -147,6 +328,8 @@ test("engine integration: spawn, probe liveness, tombstone on kill", { timeout: 
   assert.ok(existsSync(tomb), "tombstone written on kill");
   const line = readFileSync(tomb, "utf8").trim();
   assert.ok(line.includes("kill"), `tombstone records the reason: ${line}`);
+  const tombstone = JSON.parse(line) as { sessionFile?: string };
+  assert.equal(tombstone.sessionFile, hub.getView(id)?.sessionFile, "tombstone retains the resumable session reference");
   await hub.shutdownAll();
 });
 

@@ -101,8 +101,10 @@ ln -s "$PWD/extensions/subagents" ~/.pi/agent/extensions/subagents
 
 - Pass `cwd` to `spawn_subagent` or `Task` when a child must work in an isolated worktree.
 - After spawning, continue only genuinely independent work. Otherwise, end your turn immediately. Never launch `pi` through bash, create PID/exit files, poll, sleep, inspect child processes, or manufacture busywork while waiting.
-- Parent models steer with `steer_subagent`; this keeps control messages out of assistant output and reports a failed child immediately. Humans may still type `@<child-id> <message>` (`@all` broadcasts, `@user` returns to the parent).
-- Child failures are delivered as model-visible follow-up messages. An unsupported provider/model pair trips a session-local circuit breaker so retries cannot create a fleet of identical failures.
+- Parent models steer with `steer_subagent`; this keeps control messages out of assistant output and reports a failed child immediately. A busy child receives guidance after its current tool batch and before its next model call; an idle child starts a fresh turn. The hub records steering as queued, delivered, or missed and alerts the parent when a child finishes before accepted guidance lands. Humans may still type `@<child-id> <message>` (`@all` broadcasts, `@user` returns to the parent).
+- `get_subagent_status` provides bounded read-only fleet status for explicit diagnosis after an alert. It is not a polling primitive.
+- Completions, asks, failures, and attention events are micro-batched at the same safe parent turn boundary. Wake-ups are journalled before send and acknowledged afterward, so an unacknowledged delivery is restored after session reload instead of disappearing.
+- Child failures are delivered as model-visible follow-up messages. A child that settles without `DONE-PARENT` becomes `settled` and wakes the parent rather than remaining falsely `working`. An unsupported provider/model pair trips a session-local circuit breaker so retries cannot create a fleet of identical failures.
 - Children have pi's normal built-in tools enabled; unrelated extensions and
   skills remain disabled for isolation.
 - The focusable **fleet ticker** below the editor shows each child: status,
@@ -115,7 +117,11 @@ ln -s "$PWD/extensions/subagents" ~/.pi/agent/extensions/subagents
   session file (chrono/jump/entry-id navigation, `c` copies an entry).
 - Children end only on their own `DONE-PARENT` or your cancel; crashes and
   transport-dead children get tombstones under the subagent ground and are
-  resumable (`/subagent resume <id>`).
+  resumable (`/subagent resume <id>`). One heartbeat may be in flight per
+  child. Three transport misses terminate a non-tool child with one exact
+  failure; misses during a known running tool are non-fatal. Responsive but
+  progress-frozen children raise attention after 450s between model/tool
+  events or 1200s inside a tool, without semantic auto-kill.
 
 ## Status
 

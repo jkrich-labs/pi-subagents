@@ -7,7 +7,8 @@
 import { CustomEditor, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Ground } from "./ground.ts";
-import { Hub, type Delivery, type SpawnRequest } from "./hub.ts";
+import { Hub, type ChildStatusSnapshot, type Delivery, type SpawnRequest } from "./hub.ts";
+import { boundLensText } from "./lenses.ts";
 import { benchmarkChildPolicyFromEnvironment } from "./benchmark-policy.ts";
 import { LivenessEngine } from "./liveness/engine.ts";
 import { ring } from "./ring/store.ts";
@@ -139,6 +140,17 @@ export function spawnSuccessText(id: string, label: string): string {
   ].join(" ");
 }
 
+function statusLine(status: ChildStatusSnapshot): string {
+  const activity = status.isStreaming ? "streaming" : "idle";
+  const tool = status.currentTool ? ` tool=${status.currentTool}` : "";
+  const attention = status.attentionKind
+    ? ` attention=${status.attentionKind} ${status.attentionMessage ?? ""}`
+    : "";
+  const steer = status.steerState ? ` steer=${status.steerState}` : "";
+  const error = status.error ? ` error=${status.error}` : "";
+  return `${status.id} ${status.status} ${activity} alive=${status.alive}${tool}${steer}${attention}${error}`.trim();
+}
+
 export function spawnToolResult(id: string, label: string, agent?: string, terminate = true): SpawnToolResult {
   return {
     content: [{ type: "text", text: spawnSuccessText(id, label) }],
@@ -148,6 +160,7 @@ export function spawnToolResult(id: string, label: string, agent?: string, termi
 }
 
 function extractText(msg: Record<string, unknown>): string {
+  if (typeof msg.content === "string") return msg.content;
   const content = msg.content as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(content)) return "";
   return content
@@ -158,9 +171,10 @@ function extractText(msg: Record<string, unknown>): string {
 
 export default function (pi: ExtensionAPI) {
   const ground = new Ground();
+  const deliveryQueue = new ParentDeliveryQueue(pi);
   const hub = new Hub({
     ground,
-    deliver: (d: Delivery) => deliverToParent(pi, d),
+    deliver: (d: Delivery) => deliveryQueue.enqueue(d),
     benchmarkChildPolicy: benchmarkChildPolicyFromEnvironment(),
   });
   const engine = new LivenessEngine(hub, ground.tombstones);
@@ -175,11 +189,14 @@ export default function (pi: ExtensionAPI) {
     engine.tick();
   };
 
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
+    const entries = (ctx as ExtensionCommandContext).sessionManager?.getEntries?.() ?? [];
+    deliveryQueue.restore(entries);
     if (pollTimer === null) pollTimer = setInterval(poll, 1000);
   });
 
   pi.on("session_shutdown", async () => {
+    deliveryQueue.dispose();
     stopTui?.();
     stopTui = null;
     if (pollTimer !== null) {
@@ -318,6 +335,34 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "get_subagent_status",
+    label: "Get Subagent Status",
+    description:
+      "Read bounded hub-owned status for one child or the current fleet. Use for explicit recovery and diagnostics; never poll it in a loop.",
+    promptSnippet: "Inspect bounded subagent status after an alert or when the user asks",
+    promptGuidelines: [
+      "Use get_subagent_status after a subagent attention/failure message or when the user explicitly asks for status.",
+      "Do not poll get_subagent_status repeatedly; the hub proactively delivers completions, failures, and attention events.",
+    ],
+    parameters: Type.Object({
+      child_id: Type.Optional(Type.String({ description: "Exact child id; omit for the fleet" })),
+    }),
+    async execute(_toolCallId, params) {
+      const childId = typeof params.child_id === "string" ? params.child_id.trim() : undefined;
+      const children = hub.statuses(childId || undefined).slice(0, 20);
+      const text = children.length > 0
+        ? children.map(statusLine).join("\n")
+        : childId
+          ? `Unknown subagent: ${childId}`
+          : "No subagents recorded in this session.";
+      return {
+        content: [{ type: "text" as const, text }],
+        details: { children },
+      };
+    },
+  });
+
   // Cursor's AwaitShell schema is not public or stable. This permissive shim
   // preserves the learned control-flow affordance without introducing polling.
   pi.registerTool({
@@ -368,7 +413,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Parent assistant text → child routing (parent steering while working).
+  // Synthetic user-message completion also acknowledges durable delivery.
   pi.on("message_end", (event) => {
+    if (event.message.role === "user") {
+      deliveryQueue.acknowledgeMessage(event.message as unknown as Record<string, unknown>);
+      return;
+    }
     if (event.message.role !== "assistant") return;
     const text = extractText(event.message as unknown as Record<string, unknown>);
     for (const s of routeSteers(text)) {
@@ -482,42 +532,170 @@ function loadEntriesFromFile(sessionFile: string | undefined): SessionEntryLike[
   }
 }
 
-export function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
+function parentMessageFor(d: Delivery): string | undefined {
   switch (d.type) {
     case "lens":
-      pi.appendEntry("subagent_lens", d.lens);
-      if (d.final && d.lens.type === "completion") {
-        pi.sendUserMessage(
-          `[subagent ${d.lens.childId}] COMPLETED:\n${d.lens.digest}`,
-          { deliverAs: "steer" },
-        );
-      }
-      break;
+      return d.final && d.lens.type === "completion"
+        ? `[subagent ${d.lens.childId}] COMPLETED:\n${d.lens.digest}`
+        : undefined;
     case "ask":
-      pi.sendUserMessage(`[subagent ${d.childId}] ASK: ${d.question}`, { deliverAs: "steer" });
-      break;
+      return `[subagent ${d.childId}] ASK: ${d.question}`;
+    case "attention":
+      return `[subagent ${d.childId}] NEEDS ATTENTION (${d.kind}):\n${boundLensText(d.summary)}\nInspect with get_subagent_status before deciding whether to steer, stop, or resume.`;
     case "control":
-      if (d.token === "DONE-PARENT") {
-        pi.appendEntry("subagent_done", { childId: d.childId, at: Date.now() });
-        if (!d.reportDelivered) {
-          pi.sendUserMessage(
-            `[subagent ${d.childId}] COMPLETED with no textual report.`,
-            { deliverAs: "steer" },
-          );
-        }
-      }
-      break;
+      return d.token === "DONE-PARENT" && !d.reportDelivered
+        ? `[subagent ${d.childId}] COMPLETED with no textual report.`
+        : undefined;
     case "crash": {
-      pi.appendEntry("subagent_crash", { childId: d.childId, reason: d.reason, at: Date.now() });
       const retryGuidance = d.reason === "model is not supported by provider"
         ? " Do not retry this provider/model selection; use a supported named preset."
         : " Inspect the failure before deciding whether to resume or replace it.";
-      pi.sendUserMessage(
-        `[subagent ${d.childId}] FAILED: ${d.reason}.${retryGuidance}`,
-        { deliverAs: "steer" },
-      );
-      break;
+      return `[subagent ${d.childId}] FAILED: ${d.reason}.${retryGuidance}`;
     }
+  }
+}
+
+function recordParentDelivery(pi: ExtensionAPI, d: Delivery): void {
+  switch (d.type) {
+    case "lens":
+      pi.appendEntry("subagent_lens", d.lens);
+      break;
+    case "ask":
+      pi.appendEntry("subagent_ask", { childId: d.childId, question: d.question, at: Date.now() });
+      break;
+    case "attention":
+      pi.appendEntry("subagent_attention", {
+        childId: d.childId,
+        kind: d.kind,
+        summary: boundLensText(d.summary),
+        at: Date.now(),
+      });
+      break;
+    case "control":
+      if (d.token === "DONE-PARENT") pi.appendEntry("subagent_done", { childId: d.childId, at: Date.now() });
+      break;
+    case "crash":
+      pi.appendEntry("subagent_crash", { childId: d.childId, reason: d.reason, at: Date.now() });
+      break;
+  }
+}
+
+export function deliverToParent(pi: ExtensionAPI, d: Delivery): void {
+  const message = parentMessageFor(d);
+  recordParentDelivery(pi, d);
+  if (message) pi.sendUserMessage(message, { deliverAs: "steer" });
+}
+
+interface PendingParentDelivery {
+  id: string;
+  message: string;
+  attempts: number;
+}
+
+/**
+ * Durable, micro-batched fresh-turn delivery. Semantic records are persisted
+ * before model wake-up; an interrupted session replays unacknowledged entries.
+ */
+const DELIVERY_MARKER = /^\[subagent-deliveries:([^\]]+)\](?:\n|$)/;
+
+export class ParentDeliveryQueue {
+  private readonly pi: ExtensionAPI;
+  private readonly delayMs: number;
+  private pending: PendingParentDelivery[] = [];
+  private known = new Set<string>();
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private sequence = 0;
+
+  constructor(pi: ExtensionAPI, delayMs = 10) {
+    this.pi = pi;
+    this.delayMs = delayMs;
+  }
+
+  enqueue(delivery: Delivery): void {
+    const message = parentMessageFor(delivery);
+    if (message) {
+      const id = `${Date.now().toString(36)}-${++this.sequence}`;
+      // Journal the wake-up before any other side effect: restart recovery may
+      // duplicate a tiny send/ack race, but it cannot silently lose delivery.
+      this.pi.appendEntry("subagent_delivery_pending", { id, message, at: Date.now() });
+      this.enqueuePending({ id, message, attempts: 0 });
+    }
+    recordParentDelivery(this.pi, delivery);
+  }
+
+  restore(entries: readonly unknown[]): void {
+    const delivered = new Set<string>();
+    const pending: PendingParentDelivery[] = [];
+    for (const raw of entries) {
+      const entry = raw as { type?: unknown; customType?: unknown; data?: unknown; message?: unknown };
+      if (entry.type === "message" && typeof entry.message === "object" && entry.message !== null) {
+        for (const id of this.deliveryIds(extractText(entry.message as Record<string, unknown>))) delivered.add(id);
+        continue;
+      }
+      if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) continue;
+      const data = entry.data as { id?: unknown; message?: unknown };
+      if (typeof data.id !== "string") continue;
+      if (entry.customType === "subagent_delivery_delivered") delivered.add(data.id);
+      if (entry.customType === "subagent_delivery_pending" && typeof data.message === "string") {
+        pending.push({ id: data.id, message: data.message, attempts: 0 });
+      }
+    }
+    for (const item of pending) {
+      if (!delivered.has(item.id)) this.enqueuePending(item);
+    }
+  }
+
+  acknowledgeMessage(message: Record<string, unknown>): void {
+    for (const id of this.deliveryIds(extractText(message))) {
+      if (!this.known.delete(id)) continue;
+      this.pi.appendEntry("subagent_delivery_delivered", { id, at: Date.now() });
+    }
+  }
+
+  dispose(): void {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+    this.pending = [];
+    this.known.clear();
+  }
+
+  private deliveryIds(text: string): string[] {
+    const match = DELIVERY_MARKER.exec(text);
+    return match ? match[1].split(",").map((id) => id.trim()).filter(Boolean) : [];
+  }
+
+  private enqueuePending(item: PendingParentDelivery): void {
+    if (this.known.has(item.id)) return;
+    this.known.add(item.id);
+    this.pending.push(item);
+    this.schedule();
+  }
+
+  private schedule(delay = this.delayMs): void {
+    if (this.timer !== null) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flush();
+    }, delay);
+    this.timer.unref?.();
+  }
+
+  private flush(): void {
+    if (this.pending.length === 0) return;
+    const batch = this.pending.splice(0, 8);
+    const marker = `[subagent-deliveries:${batch.map((item) => item.id).join(",")}]`;
+    try {
+      this.pi.sendUserMessage(`${marker}\n${batch.map((item) => item.message).join("\n\n---\n\n")}`, { deliverAs: "steer" });
+    } catch {
+      for (const item of batch) {
+        item.attempts += 1;
+        this.pending.push(item);
+      }
+      const attempts = Math.max(...batch.map((item) => item.attempts));
+      if (attempts <= 3) this.schedule(100 * (2 ** (attempts - 1)));
+      return;
+    }
+    if (this.pending.length > 0) this.schedule();
   }
 }
 

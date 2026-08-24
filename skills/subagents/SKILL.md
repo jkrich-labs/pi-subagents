@@ -20,7 +20,7 @@ delegating/steering children through the hub.
   enforces this — a second steer is refused until the child settles.
 - No caps of any kind. Don't assign turn/token/wall-clock budgets. Done-ness is
   the child's own `DONE-PARENT` or the user's cancel.
-- Child outputs are mail-in, not polled. Read completions or questions when the hub surfaces them.
+- Child outputs are mail-in, not polled. Read completions, questions, failures, or attention events when the hub surfaces them. Wake-ups are durable and micro-batched at a safe parent turn boundary.
 - After spawning, continue only genuinely independent useful work. If the remaining work depends on a child, end your turn immediately.
 - While waiting, never poll, sleep, or manufacture busywork. Do not inspect or kill child processes; the hub owns their lifecycle and delivers completion automatically.
 - Child sessions always persist (`--session-dir`, no `--no-session`), so
@@ -30,7 +30,8 @@ delegating/steering children through the hub.
 
 - `spawn_subagent` (tool) — prefer a bundled `agent` name plus a complete prompt. A named call uses its pinned provider, model, thinking level, tools, and role prompt. Explicit `model`, `provider`, or `thinking` values override the preset independently, except OpenAI-family models always use the subscription-backed `openai-codex` provider. Calls without `agent` require `title` and use the `general-purpose` preset. Pass `cwd` for an isolated worktree.
 - `Task` (tool) — Cursor-compatible alias. Pass `subagent_type` and `prompt`; it routes through the same named-agent resolver and accepts `cwd` for an isolated worktree.
-- `steer_subagent` (tool) — send guidance to one live child. Parent models use this instead of emitting visible `@child-id` assistant text; steering a failed child returns its failure immediately.
+- `steer_subagent` (tool) — send guidance to one live child. Parent models use this instead of emitting visible `@child-id` assistant text; steering a failed child returns its failure immediately. Busy-child guidance lands after the current tool batch and before the next model call. The hub records queued/delivered/missed state and alerts on a missed steer.
+- `get_subagent_status` (tool) — bounded read-only status for one child or the fleet. Use after an attention/failure message or an explicit user request; never loop on it.
 - `AwaitShell` (tool) — compatibility yield only. It ends the parent turn and never polls.
 - Bundled agents:
   - `explorer` — `openai-codex/gpt-5.6-luna`, `medium`
@@ -67,6 +68,8 @@ Children speak codes in their completion. The routing table:
 - Crashed/transport-dead children are tombstoned; the tombstone names the
   session file. Killing a child loses no work — `/subagent resume <id>`
   re-links the same session file.
+- A child that settles without `DONE-PARENT` is marked `settled` and wakes the parent with a bounded diagnostic; it is never left silently `working`.
+- Responsive children with no model/tool progress raise attention after the progress threshold. These semantic warnings never auto-kill the child.
 - Orphans from dead parents are reaped at next hub startup via pidfile + ppid
   check.
 - Loop/stall probes ask the child to reply `KEEP-GOING`; probes never auto-kill.
