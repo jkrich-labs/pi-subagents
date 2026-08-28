@@ -44,6 +44,7 @@ export const CHILD_CONTROL_PROTOCOL = [
   "Work autonomously on your assigned task. There are no turn, token or time limits.",
   "When your task is complete, write a final report and end it with the exact line: DONE-PARENT",
   "If you are blocked on a question only the parent can answer, ask it as a line of the form: ASK: <question>",
+  "Never finish a turn without one of: the exact line DONE-PARENT, an ASK: line, or an explicit request to continue. A report alone is not a completion — the parent needs DONE-PARENT on its own line as the final line of your final message.",
   "Never write DONE-PARENT before your task is complete.",
 ].join("\n");
 

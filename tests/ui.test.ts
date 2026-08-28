@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatElapsed, renderTicker, renderTickerLine } from "../extensions/subagents/ui/ticker.ts";
+import { formatCost, formatElapsed, formatTokens, renderTicker, renderTickerLine } from "../extensions/subagents/ui/ticker.ts";
 import {
   conversationSegments,
   navigator,
@@ -75,6 +75,39 @@ test("ticker: no compactions/badges omitted; empty fleet renders nothing", () =>
   const lines = renderTicker([view({ status: "working", spawnedAt: now - 9_000 })], now);
   assert.equal(lines.length, 1);
   assert.ok(lines[0].includes("working"));
+});
+test("formatTokens and formatCost render compact live usage", () => {
+assert.equal(formatTokens(0), "");
+  assert.equal(formatTokens(-5), "");
+  assert.equal(formatTokens(499), "499t");
+  assert.equal(formatTokens(4_900), "4.9kt");
+  assert.equal(formatTokens(12_345), "12kt");
+  assert.equal(formatTokens(1_200_000), "1.2Mt");
+  assert.equal(formatTokens(12_000_000), "12Mt");
+  assert.equal(formatCost(0), "");
+  assert.equal(formatCost(-1), "");
+  assert.equal(formatCost(0.0052), "$0.0052");
+  assert.equal(formatCost(0.1234), "$0.123");
+});
+
+test("ticker line shows live token tally and cost after last completion", () => {
+  const now = 1_000_000_000;
+  const line = renderTickerLine(
+    view({
+      status: "working",
+      spawnedAt: now - 9_000,
+      turnCount: 3,
+      lastCompletionAt: now - 4_000,
+      usage: { totalTokens: 2_400_000, inputTokens: 900_000, outputTokens: 200_000, cacheReadTokens: 1_300_000, cacheWriteTokens: 0, costUsd: 12.345 },
+    }),
+    now,
+  );
+  assert.ok(line.text.includes("2.4Mt"), "token tally segment");
+  assert.ok(line.text.includes("$12.345"), "cost segment");
+  assert.ok(line.text.indexOf("2.4Mt") > line.text.indexOf("last+4s"), "usage appears after the last-completion segment");
+  const bare = renderTickerLine(view({ status: "done", spawnedAt: now - 9_000 }), now);
+  assert.ok(!bare.text.includes("kt"), "no usage segment without tokens");
+  assert.ok(!bare.text.includes("$"), "no cost segment without cost");
 });
 
 test("formatElapsed: seconds, minutes, hours", () => {

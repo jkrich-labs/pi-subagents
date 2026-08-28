@@ -105,8 +105,8 @@ ln -s "$PWD/extensions/subagents" ~/.pi/agent/extensions/subagents
 - `get_subagent_status` provides bounded read-only fleet status for explicit diagnosis after an alert. It is not a polling primitive.
 - Completions, asks, failures, and attention events are micro-batched at the same safe parent turn boundary. Wake-ups are journalled before send and acknowledged afterward, so an unacknowledged delivery is restored after session reload instead of disappearing.
 - Child failures are delivered as model-visible follow-up messages. A child that settles without `DONE-PARENT` becomes `settled` and wakes the parent rather than remaining falsely `working`. An unsupported provider/model pair trips a session-local circuit breaker so retries cannot create a fleet of identical failures.
-- Children have pi's normal built-in tools enabled; unrelated extensions and
-  skills remain disabled for isolation.
+- Children inherit pi's full environment/resources — including project-local
+  extensions, skills, prompts, themes, and context files — plus normal tools.
 - The focusable **fleet ticker** below the editor shows each child: status,
   model::thinking, turns, compactions, elapsed, last completion, and badges.
   Press **Down** when editor navigation is exhausted to enter it, use Up/Down

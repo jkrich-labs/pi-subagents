@@ -7,7 +7,7 @@
  */
 import { Ground } from "./ground.ts";
 import { RpcChild, type CommandResponse, type RpcChildHandle, type RpcChildOptions } from "./child.ts";
-import { ring, type AttentionKind, type ChildView } from "./ring/store.ts";
+import { ring, accumulateUsage, blankUsage, type AttentionKind, type ChildView } from "./ring/store.ts";
 import { reportFrom as tokenReport } from "./tokens.ts";
 import { boundLensText, makeAskLens, makeCompletionLens, type Lens } from "./lenses.ts";
 import { resolveSpawn } from "./registry.ts";
@@ -78,6 +78,8 @@ export interface ChildStatusSnapshot {
   steerState?: ChildView["steerState"];
   steerQueuedAt?: number;
   lastSteerAt?: number;
+  usage: ChildView["usage"];
+  completionConfirmations: number;
 }
 
 const ACTIVE_STATUSES = new Set<ChildView["status"]>(["spawning", "working", "asking"]);
@@ -116,6 +118,7 @@ export const CHILD_SYSTEM_PROMPT = [
   "Work autonomously on your assigned task. There are no turn, token or time limits.",
   "When your task is complete, write a final report and end it with the exact line: DONE-PARENT",
   "If you are blocked on a question only the parent can answer, ask it as a line of the form: ASK: <question>",
+  "Never finish a turn without one of: the exact line DONE-PARENT, an ASK: line, or an explicit request to continue. A report alone is not a completion — the parent needs DONE-PARENT on its own line as the final line of your final message.",
   "Never write DONE-PARENT before your task is complete.",
 ].join("\n");
 
@@ -455,6 +458,8 @@ export class Hub {
           st.pendingTurnMessage = turnFailure ? undefined : msg;
           st.pendingTurnError = turnFailure;
           const content = (turnFailure ? [] : (msg?.content ?? [])) as Array<Record<string, unknown>>;
+          const usage = (msg?.usage ?? (line.message as Record<string, unknown> | undefined)?.usage) as Record<string, unknown> | undefined;
+          ring.upsert(id, { usage: accumulateUsage(ring.get(id)?.usage ?? blankUsage(), usage) });
           const toolCalls = content.filter((c) => c.type === "toolCall").length;
           const thinkingText = content
             .filter((c) => c.type === "thinking")
@@ -665,21 +670,51 @@ export class Hub {
       void this.steer(st.id, "Continue your assigned work. Report only when complete or blocked.").catch((error) => {
         this.reportAttention(st.id, "semantic-stall", `KEEP-GOING was accepted but continuation failed: ${safeErrorDetail(String(error))}`);
       });
-    } else {
+    } else if (clean.length === 0) {
       ring.upsert(st.id, {
         status: "settled",
         ask: undefined,
         error: undefined,
-        lastCompletionAt: clean.length > 0 ? Date.now() : undefined,
       });
       this.scheduleIdleReap(st);
       this.reportAttention(
         st.id,
         "settled-without-completion",
-        clean.length > 0
-          ? clean
-          : "The child settled without DONE-PARENT, an ASK, or a textual report.",
+        "The child settled without DONE-PARENT, an ASK, or a textual report.",
       );
+    } else {
+      // Work finished without the completion marker: the model forgot the
+      // protocol line (observed in the field). Ask once for a confirmation;
+      // the second omission is a real attention-worthy incident.
+      const confirmations = (ring.get(st.id)?.completionConfirmations ?? 0) + 1;
+      if (confirmations >= 2) {
+        ring.upsert(st.id, {
+          status: "settled",
+          ask: undefined,
+          error: undefined,
+          lastCompletionAt: Date.now(),
+          completionConfirmations: confirmations,
+        });
+        this.scheduleIdleReap(st);
+        this.reportAttention(
+          st.id,
+          "settled-without-completion",
+          clean,
+        );
+      } else {
+        ring.upsert(st.id, {
+          status: "working",
+          ask: undefined,
+          error: undefined,
+          completionConfirmations: confirmations,
+        });
+        void this.steer(
+          st.id,
+          "Confirm completion: restate your final report as a short conclusion and end it with the exact line: DONE-PARENT",
+        ).catch((error) => {
+          this.reportAttention(st.id, "settled-without-completion", `Completion confirmation could not be delivered: ${safeErrorDetail(String(error))}`);
+        });
+      }
     }
 
     if (report.reset) this.deliverFor(st.generation, { type: "control", childId: st.id, token: "RESET-PARENT" });
@@ -833,6 +868,8 @@ export class Hub {
       steerState: view.steerState,
       steerQueuedAt: view.steerQueuedAt,
       lastSteerAt: view.lastSteerAt,
+      usage: view.usage,
+      completionConfirmations: view.completionConfirmations,
     }));
   }
 

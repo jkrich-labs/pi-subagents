@@ -11,6 +11,7 @@ import { applyKeepGoing, probeDecision, type ProbeState } from "./probe.ts";
 import { JsonlTombstones } from "./tombstones.ts";
 import { writePidfile, removePidfile, sweep, pidAlive, processIdentity } from "./orphan-reaper.ts";
 import { ring, type AttentionKind } from "../ring/store.ts";
+export const DEFAULT_LONG_TURN_MS = 600_000;
 
 export interface EngineManifest {
   heartbeat: ReturnType<typeof freshHeartbeat>;
@@ -22,6 +23,10 @@ export interface EngineManifest {
   turnIndex: number;
   midTool: boolean;
   isStreaming: boolean;
+  /** When the current agent run started; undefined while settled/done. */
+  turnBusySince?: number;
+  /** When the last completed turn_end arrived. */
+  lastTurnEndAt?: number;
 }
 
 export interface LivenessOptions {
@@ -31,6 +36,8 @@ export interface LivenessOptions {
   providerQuietMs?: number;
   /** Quiet in-tool threshold. Warning only; never an automatic kill. */
   toolQuietMs?: number;
+  /** Unfinished-run attention: streaming (or between-turn) longer than this. */
+  longTurnMs?: number;
 }
 
 const DEFAULT_HEARTBEAT_QUIET_MS = 5_000;
@@ -60,6 +67,7 @@ export class LivenessEngine {
   private readonly heartbeatQuietMs: number;
   private readonly providerQuietMs: number;
   private readonly toolQuietMs: number;
+  private readonly longTurnMs: number;
   private states = new Map<string, EngineManifest>();
 
   constructor(hub: Hub, tombstonesDir: string, options: LivenessOptions = {}) {
@@ -68,6 +76,7 @@ export class LivenessEngine {
     this.heartbeatQuietMs = threshold(options.heartbeatQuietMs, DEFAULT_HEARTBEAT_QUIET_MS);
     this.providerQuietMs = threshold(options.providerQuietMs, DEFAULT_PROVIDER_QUIET_MS);
     this.toolQuietMs = threshold(options.toolQuietMs, DEFAULT_TOOL_QUIET_MS);
+    this.longTurnMs = threshold(options.longTurnMs, DEFAULT_LONG_TURN_MS);
     this.hub.onSpawn = (id) => this.onSpawn(id);
     this.hub.onExit = (id, reason) => this.onExit(id, reason);
     this.hub.onEvent = (id, line) => this.onEvent(id, line);
@@ -86,6 +95,8 @@ export class LivenessEngine {
       turnIndex: 0,
       midTool: false,
       isStreaming: view?.isStreaming ?? true,
+      turnBusySince: undefined,
+      lastTurnEndAt: undefined,
     });
     const child = this.hub.getChild(id);
     if (child?.proc.pid) {
@@ -129,10 +140,15 @@ export class LivenessEngine {
     const st = this.states.get(id);
     if (!st) return;
     const type = typeof line.type === "string" ? line.type : "";
-    if (type === "agent_start") st.isStreaming = true;
+    if (type === "agent_start") {
+      st.isStreaming = true;
+      st.turnBusySince = Date.now();
+    }
     if (type === "agent_settled") {
       st.isStreaming = false;
       st.midTool = false;
+      st.turnBusySince = undefined;
+      st.lastTurnEndAt = undefined;
     }
     if (type === "tool_execution_start") st.midTool = true;
     if (type === "tool_execution_end") st.midTool = false;
@@ -147,6 +163,7 @@ export class LivenessEngine {
         lastMissWasMidToolInARow: false,
       });
       if (type !== "agent_settled") this.hub.clearAttention(id, LIVENESS_ATTENTION);
+      if (type === "agent_settled") this.hub.clearAttention(id, ["long-turn"]);
     }
   }
 
@@ -176,7 +193,10 @@ export class LivenessEngine {
   private onTurn(id: string, rec: { toolCallCount: number; thinkingText: string; reportText: string; toolNames: string[]; toolArgsHash: string; toolResultsHash: string; assistantText: string }): void {
     const st = this.states.get(id);
     if (!st) return;
+    this.hub.clearAttention(id, ["long-turn"]);
     st.turnIndex += 1;
+    st.lastTurnEndAt = Date.now();
+    st.turnBusySince = Date.now();
 
     if (exactLine(rec.assistantText, "KEEP-GOING")) {
       st.probe = applyKeepGoing(st.probe);
@@ -229,6 +249,24 @@ export class LivenessEngine {
     }
   }
 
+  /** Wall-clock attention: the current run (or the space between turns) has
+   * been unfinished for `longTurnMs`, regardless of streaming token deltas.
+   * Deliberately NOT based on lastActivityAt — a k3::max-style runaway can
+   * stream warm deltas forever while producing zero completed turns.
+   */
+  private checkLongTurn(id: string, st: EngineManifest, view: { isStreaming?: boolean; currentTool?: string }, now: number): void {
+    if (!view.isStreaming || view.currentTool) return; // mid-tool stays in the tool-stall regime
+    const since = Math.max(st.turnBusySince ?? 0, st.lastTurnEndAt ?? 0);
+    if (since === 0) return;
+    const unmet = now - since;
+    if (unmet < this.longTurnMs) return;
+    this.hub.reportAttention(
+      id,
+      "long-turn",
+      `No completed turn for ${Math.floor(unmet / 1000)}s while the child is still running (streaming or between turns). It was not interrupted.`,
+    );
+  }
+
   /** Poll tick: sweep orphan pidfiles, check progress, and run one heartbeat per child. */
   tick(now = Date.now()): void {
     const result = sweep(this.hub.ground.pids, (pid) => {
@@ -246,6 +284,7 @@ export class LivenessEngine {
       const view = this.hub.getView(id);
       if (!child || !child.isRunning() || !st || !view || st.transportFailing) continue;
       this.checkQuietProgress(id, now);
+      this.checkLongTurn(id, st, view, now);
       if (st.heartbeatPending || now - (view.lastEventAt ?? view.spawnedAt) < this.heartbeatQuietMs) continue;
 
       st.heartbeatPending = true;

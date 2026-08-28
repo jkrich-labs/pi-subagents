@@ -239,7 +239,7 @@ test("hub: a completed child can be steered again while it remains idle", async 
   }
 });
 
-test("hub: settled work without DONE-PARENT becomes model-visible attention instead of silent working", async () => {
+test("hub: text settle without DONE-PARENT asks once for confirmation; repeat omission escalates to attention", async () => {
   ring.reset();
   const deliveries: Delivery[] = [];
   const recorder = recordingChildren();
@@ -257,19 +257,127 @@ test("hub: settled work without DONE-PARENT becomes model-visible attention inst
     emit({ type: "turn_end", message: assistant });
     emit({ type: "agent_end", messages: [assistant] });
     emit({ type: "agent_settled" });
-    emit({ type: "agent_settled" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-    assert.equal(hub.getView(id)?.status, "settled", "settled is distinct from actively working");
-    assert.equal(hub.isAlive(id), true, "the idle session remains reusable");
-    const attentions = deliveries.filter((delivery) => (delivery as { type: string }).type === "attention") as Array<{
+    assert.equal(hub.getView(id)?.status, "working", "first report-without-marker triggers a confirmation prompt, not idle settle");
+    assert.equal(hub.getView(id)?.completionConfirmations, 1, "confirmation count is recorded on the view");
+    assert.equal(
+      recorder.commands.filter((command) => command.command === "prompt").length,
+      2,
+      "the confirmation steer is delivered as a fresh prompt",
+    );
+    assert.equal(
+      deliveries.filter((delivery) => delivery.type === "attention").length,
+      0,
+      "the first omission is not yet an attention-worthy incident",
+    );
+
+    // The child settles again without the marker → the real incident.
+    emit({ type: "turn_end", message: assistant });
+    emit({ type: "agent_end", messages: [assistant] });
+    emit({ type: "agent_settled" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(hub.getView(id)?.status, "settled");
+    assert.equal(hub.getView(id)?.completionConfirmations, 2);
+    const attentions = deliveries.filter((delivery) => delivery.type === "attention") as Array<{
       type: "attention";
       childId: string;
       kind: string;
       summary: string;
     }>;
-    assert.equal(attentions.length, 1, "duplicate settlement cannot produce repeated wake-ups");
+    assert.equal(attentions.length, 1, "the repeat omission is the real incident");
     assert.equal(attentions[0].kind, "settled-without-completion");
     assert.match(attentions[0].summary, /task is complete.*checks pass/i);
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: empty settle without any report still escalates immediately", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: (delivery) => deliveries.push(delivery), spawnChild: recorder.spawnChild });
+
+  try {
+    const id = await hub.spawn({ title: "empty", prompt: "Say nothing" });
+    const empty = {
+      role: "assistant",
+      content: [],
+      stopReason: "stop",
+    };
+    const emit = recorder.handlers[0];
+    assert.ok(emit);
+    emit({ type: "turn_end", message: empty });
+    emit({ type: "agent_end", messages: [empty] });
+    emit({ type: "agent_settled" });
+
+    assert.equal(hub.getView(id)?.status, "settled");
+    assert.equal(hub.getView(id)?.lastCompletionAt, undefined, "an empty settle is not a completion");
+    const attentions = deliveries.filter((delivery) => delivery.type === "attention");
+    assert.equal(attentions.length, 1);
+    assert.equal(attentions[0].kind, "settled-without-completion");
+  } finally {
+    await hub.shutdownAll();
+  }
+});
+
+test("hub: turn_end usage is tallied into the view and status snapshot", async () => {
+  ring.reset();
+  const recorder = recordingChildren();
+  const hub = new Hub({ ground: tmpGround(), deliver: () => {}, spawnChild: recorder.spawnChild });
+
+  try {
+    const id = await hub.spawn({ title: "usage", prompt: "work" });
+    const emit = recorder.handlers[0];
+    assert.ok(emit);
+    emit({
+      type: "turn_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "progress" }],
+        stopReason: "toolUse",
+        usage: {
+          input: 100,
+          output: 50,
+          cacheRead: 200,
+          cacheWrite: 25,
+          reasoning: 10,
+          totalTokens: 375,
+          cost: { input: 0.001, output: 0.002, cacheRead: 0.003, cacheWrite: 0.004, total: 0.01 },
+        },
+      },
+    });
+    emit({
+      type: "turn_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "more" }],
+        stopReason: "stop",
+        usage: {
+          input: 10,
+          output: 5,
+          cacheRead: 20,
+          cacheWrite: 2,
+          totalTokens: 37,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 },
+        },
+      },
+    });
+
+    const usage = hub.getView(id)?.usage;
+    assert.ok(usage, "usage field present");
+    assert.equal(usage.totalTokens, 412);
+    assert.equal(usage.inputTokens, 110);
+    assert.equal(usage.outputTokens, 55);
+    assert.equal(usage.cacheReadTokens, 220);
+    assert.equal(usage.cacheWriteTokens, 27);
+    assert.ok(Math.abs(usage.costUsd - 0.011) < 1e-9, `cost accumulated: ${usage.costUsd}`);
+
+    const snapshot = hub.statuses(id)[0];
+    assert.equal(snapshot.usage.totalTokens, 412);
+    assert.equal(snapshot.completionConfirmations, 0);
   } finally {
     await hub.shutdownAll();
   }

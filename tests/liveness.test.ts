@@ -162,6 +162,85 @@ test("reaper: dead parent's pidfile orphan is reclaimed; live parent untouched",
   assert.equal(killed.length, 0, "orphan pid was already nonexistent; live-child untouched");
 });
 
+test("engine: streaming-but-unfinished child trips long-turn attention past the threshold and survives message deltas", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const controlled = controlledChild({
+    getState: async () => ({ command: "get_state", success: true, data: { isStreaming: true } }),
+  });
+  const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-longturn-")));
+  const hub = new Hub({ ground, deliver: (delivery) => deliveries.push(delivery), spawnChild: async () => controlled.child });
+  const engine = new LivenessEngine(hub, ground.tombstones, {
+    heartbeatQuietMs: Number.POSITIVE_INFINITY,
+    providerQuietMs: Number.POSITIVE_INFINITY,
+    toolQuietMs: Number.POSITIVE_INFINITY,
+    longTurnMs: 50,
+  });
+
+  const id = await hub.spawn({ title: "long-turn", prompt: "work" });
+  controlled.emit({ type: "agent_start" });
+  // Warm streaming deltas keep lastActivityAt fresh — the exact scenario that
+  // hid the k3::max runaway from provider-stall detection.
+  const base = Date.now();
+  engine.tick(base + 20);
+  controlled.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "tokens" } });
+  engine.tick(base + 60);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(hub.isAlive(id), true, "long-turn is advisory; the child is never killed");
+  assert.equal(hub.getView(id)?.attentionKind, "long-turn");
+  const attentions = deliveries.filter((delivery) => delivery.type === "attention");
+  assert.equal(attentions.length, 1, "one long-turn attention fires");
+  assert.equal(attentions[0].kind, "long-turn");
+
+  controlled.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "still working" } });
+  assert.equal(
+    hub.getView(id)?.attentionKind,
+    "long-turn",
+    "streaming deltas do not clear an active long-turn attention",
+  );
+  engine.tick(base + 200);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(
+    deliveries.filter((delivery) => delivery.type === "attention").length,
+    1,
+    "a single long episode cannot create a wake-up loop",
+  );
+
+  controlled.emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "progress" }], stopReason: "toolUse" } });
+  engine.tick(base + 300);
+  controlled.emit({ type: "agent_settled" });
+  engine.tick(base + 400);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(hub.getView(id)?.attentionKind, undefined, "settling closes the long-turn episode");
+  await hub.shutdownAll();
+});
+
+test("engine: long-turn stays silent while a tool is running (tool-stall regime owns mid-tool)", async () => {
+  ring.reset();
+  const deliveries: Delivery[] = [];
+  const controlled = controlledChild({
+    getState: async () => ({ command: "get_state", success: true, data: { isStreaming: true } }),
+  });
+  const ground = new Ground(mkdtempSync(join(tmpdir(), "subagentGround-longtool-")));
+  const hub = new Hub({ ground, deliver: (delivery) => deliveries.push(delivery), spawnChild: async () => controlled.child });
+  const engine = new LivenessEngine(hub, ground.tombstones, {
+    heartbeatQuietMs: Number.POSITIVE_INFINITY,
+    providerQuietMs: Number.POSITIVE_INFINITY,
+    toolQuietMs: Number.POSITIVE_INFINITY,
+    longTurnMs: 50,
+  });
+
+  const id = await hub.spawn({ title: "long-tool", prompt: "work" });
+  controlled.emit({ type: "agent_start" });
+  controlled.emit({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: {} });
+  engine.tick(Date.now() + 500);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(hub.getView(id)?.attentionKind, undefined, "mid-tool long runs stay in the tool-stall regime, not long-turn");
+  await hub.shutdownAll();
+});
+
 test("engine: responsive but quiet inference raises attention without killing the child", async () => {
   ring.reset();
   const deliveries: Delivery[] = [];

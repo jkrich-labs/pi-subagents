@@ -18,6 +18,7 @@ import { openInspectOverlay, openNavigateOverlay } from "./ui/overlay.ts";
 import { attachFleetEditorNavigation, FleetWidget, supportsFleetEditorNavigation } from "./ui/focus.ts";
 import { readFileSync } from "node:fs";
 import { agentRegistry } from "./agents.ts";
+import { formatCost, formatTokens } from "./ui/ticker.ts";
 
 const POLLING_BLOCK_REASON =
   "A subagent is still working in the background. Do not poll with shell sleeps; end this turn instead.";
@@ -148,7 +149,12 @@ function statusLine(status: ChildStatusSnapshot): string {
     : "";
   const steer = status.steerState ? ` steer=${status.steerState}` : "";
   const error = status.error ? ` error=${status.error}` : "";
-  return `${status.id} ${status.status} ${activity} alive=${status.alive}${tool}${steer}${attention}${error}`.trim();
+  const usage = status.usage
+    ? ` tokens=${formatTokens(status.usage.totalTokens)}/${status.usage.inputTokens}+${status.usage.outputTokens}+${status.usage.cacheReadTokens}+${status.usage.cacheWriteTokens}` +
+      (status.usage.costUsd > 0 ? ` cost=${formatCost(status.usage.costUsd)}` : "")
+    : "";
+  const confirmations = status.completionConfirmations > 0 ? ` confirms=${status.completionConfirmations}` : "";
+  return `${status.id} ${status.status} ${activity} alive=${status.alive}${tool}${steer}${attention}${error}${usage}${confirmations}`.trim();
 }
 
 export function spawnToolResult(id: string, label: string, agent?: string, terminate = true): SpawnToolResult {

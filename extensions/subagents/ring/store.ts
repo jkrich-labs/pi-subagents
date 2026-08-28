@@ -5,6 +5,35 @@
  */
 import { EventEmitter } from "node:events";
 import type { AgentToolPolicy } from "../agents.ts";
+export interface ChildUsage {
+  /** Total tokens across all runs of this child session (incl. cache reads). */
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+}
+
+export function blankUsage(): ChildUsage {
+  return { totalTokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
+}
+
+/** Add one turn's provider-reported usage to the running child total. */
+export function accumulateUsage(total: ChildUsage, raw: Record<string, unknown> | undefined): ChildUsage {
+  if (!raw || typeof raw !== "object") return total;
+  const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0);
+  const tokens = num(raw.totalTokens);
+  const cost = raw.cost as Record<string, unknown> | undefined;
+  return {
+    totalTokens: total.totalTokens + tokens,
+    inputTokens: total.inputTokens + num(raw.input),
+    outputTokens: total.outputTokens + num(raw.output),
+    cacheReadTokens: total.cacheReadTokens + num(raw.cacheRead),
+    cacheWriteTokens: total.cacheWriteTokens + num(raw.cacheWrite),
+    costUsd: total.costUsd + num(cost?.total),
+  };
+}
 
 export type ChildStatus =
   | "spawning"
@@ -22,8 +51,8 @@ export type AttentionKind =
   | "tool-stall"
   | "semantic-stall"
   | "semantic-loop"
-  | "missed-steer";
-
+  | "missed-steer"
+  | "long-turn";
 export type SteerDeliveryState = "queued" | "delivered" | "missed";
 
 export interface ChildView {
@@ -47,6 +76,9 @@ export interface ChildView {
   sessionFile?: string;
   stallCount: number;
   loopHits: number;
+  usage: ChildUsage;
+  /** Confirmations asked after a settle without DONE-PARENT (see hub finalize). */
+  completionConfirmations: number;
   isStreaming?: boolean;
   currentTool?: string;
   lastActivityAt?: number;
@@ -71,6 +103,8 @@ export function blankView(): ChildView {
     scopeCount: 0,
     stallCount: 0,
     loopHits: 0,
+    usage: blankUsage(),
+    completionConfirmations: 0,
   };
 }
 

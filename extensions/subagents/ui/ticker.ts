@@ -19,6 +19,25 @@ export function formatElapsed(spawnedAt: number, now = Date.now()): string {
   if (m > 0) return `${m}m${String(s % 60).padStart(2, "0")}s`;
   return `${s}s`;
 }
+export function formatCost(costUsd: number): string {
+  if (!Number.isFinite(costUsd) || costUsd <= 0) return "";
+  if (costUsd < 0.01) return `$${costUsd.toFixed(4)}`;
+  return `$${costUsd.toFixed(3)}`;
+}
+
+/** Compact live token tally: 1.2M tokens → "1.2Mt"; 4.9k → "4.9kt". */
+export function formatTokens(totalTokens: number): string {
+  if (!Number.isFinite(totalTokens) || totalTokens <= 0) return "";
+  if (totalTokens >= 1_000_000) {
+    const millions = totalTokens / 1_000_000;
+    return `${millions >= 10 ? millions.toFixed(0) : millions.toFixed(1)}Mt`;
+  }
+  if (totalTokens >= 1_000) {
+    const thousands = totalTokens / 1_000;
+    return `${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1)}kt`;
+  }
+  return `${totalTokens}t`;
+}
 
 export function renderTickerLine(v: ChildView, now = Date.now()): TickerLine {
   const modelThinking = `${v.model ?? "?"}::${v.thinking ?? "?"}`;
@@ -30,6 +49,10 @@ export function renderTickerLine(v: ChildView, now = Date.now()): TickerLine {
   if (v.lastCompletionAt) {
     parts.push(`last+${formatElapsed(v.lastCompletionAt, now)}`);
   }
+  const tokenText = formatTokens(v.usage?.totalTokens ?? 0);
+  const costText = formatCost(v.usage?.costUsd ?? 0);
+  if (tokenText) parts.push(tokenText);
+  if (costText) parts.push(costText);
 
   const badges: string[] = [];
   if (v.ask) badges.push("ASK");

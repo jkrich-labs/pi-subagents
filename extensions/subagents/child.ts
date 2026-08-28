@@ -21,14 +21,7 @@ export interface RpcChildOptions {
 }
 
 export function buildChildArgs(opts: RpcChildOptions): string[] {
-  const args = [
-    "--mode", "rpc",
-    "--no-extensions",
-    "--no-skills",
-    "--no-prompt-templates",
-    "--no-themes",
-    "--no-context-files",
-  ];
+  const args = ["--mode", "rpc", "--approve"];
   if (opts.sessionDir) args.push("--session-dir", opts.sessionDir);
   if (opts.sessionName) args.push("--name", opts.sessionName);
   if (opts.provider) args.push("--provider", opts.provider);
