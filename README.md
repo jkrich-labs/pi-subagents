@@ -91,7 +91,7 @@ ln -s "$PWD/extensions/subagents" ~/.pi/agent/extensions/subagents
   | Agent | Provider/model | Thinking |
   |---|---|---|
   | `explorer` | `openai-codex/gpt-5.6-luna` | `medium` |
-  | `planner` | `kimi-coding/k3` | `max` |
+  | `planner` | `hyper/qwen3.8-max` | `max` |
   | `mechanical-worker` | `openai-codex/gpt-5.6-luna` | `xhigh` |
   | `general-purpose` | `openai-codex/gpt-5.6-terra` | `xhigh` |
   | `senior` | `openai-codex/gpt-5.6-sol` | `xhigh` |

@@ -1,8 +1,8 @@
 ---
 name: planner
 description: Turn a defined goal into a dependency-aware implementation plan
-provider: kimi-coding
-model: k3
+provider: hyper
+model: qwen3.8-max
 thinking: max
 tools: normal
 ---

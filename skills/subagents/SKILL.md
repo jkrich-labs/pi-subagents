@@ -35,7 +35,7 @@ delegating/steering children through the hub.
 - `AwaitShell` (tool) — compatibility yield only. It ends the parent turn and never polls.
 - Bundled agents:
   - `explorer` — `openai-codex/gpt-5.6-luna`, `medium`
-  - `planner` — `kimi-coding/k3`, `max`
+  - `planner` — `hyper/qwen3.8-max`, `max`
   - `mechanical-worker` — `openai-codex/gpt-5.6-luna`, `xhigh`
   - `general-purpose` — `openai-codex/gpt-5.6-terra`, `xhigh`
   - `senior` — `openai-codex/gpt-5.6-sol`, `xhigh`
